@@ -45,6 +45,12 @@ function activateConfigureTool(pi: ExtensionAPI): void {
   if (!active.includes(CONFIGURE_TOOL)) pi.setActiveTools([...active, CONFIGURE_TOOL]);
 }
 
+function isSetupInvocation(text: string): boolean {
+  const input = text.trimStart();
+  return input.startsWith("/skill:autoresearch-setup") ||
+    /^<skill\b[^>]*\bname=["']autoresearch-setup["']/.test(input);
+}
+
 function sendSetupPrompt(pi: ExtensionAPI, roughGoal: string, notify: (message: string) => void): void {
   const goal = roughGoal.trim();
   if (!goal) {
@@ -213,6 +219,14 @@ export function registerFrontierAutoresearch(
     const active = pi.getActiveTools().filter((name) => name !== CONFIGURE_TOOL);
     pi.setActiveTools(active);
     await runtimeFor().presenter.start(ctx);
+  });
+
+  // A direct /skill:autoresearch-setup invocation, or an already-expanded
+  // <skill name="autoresearch-setup"> message, bypasses sendSetupPrompt and its
+  // tool activation. Activate the configure tool whenever the setup skill enters
+  // through the input pipeline so the agent can persist the validated RunSpec.
+  pi.on("input", (event) => {
+    if (isSetupInvocation(event.text)) activateConfigureTool(pi);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {

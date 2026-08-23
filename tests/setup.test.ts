@@ -312,6 +312,36 @@ test("prompt commands invoke setup without starting a run", async () => {
   assert.equal(sent.some((message) => message.includes(" start")), false);
 });
 
+test("input handler activates the configure tool for direct and expanded setup skill invocations", async () => {
+  const handlers = new Map<string, (event: { text: string }) => void>();
+  const activeTools: string[][] = [];
+  const fakePi = {
+    registerCommand() {},
+    registerTool() {},
+    getActiveTools: () => ["read"],
+    setActiveTools(tools: string[]) {
+      activeTools.push(tools);
+    },
+    sendUserMessage() {},
+    on(event: string, handler: (event: { text: string }) => void) {
+      handlers.set(event, handler);
+    },
+  } as unknown as ExtensionAPI;
+
+  frontierAutoresearch(fakePi);
+  const input = handlers.get("input");
+  assert.ok(input, "extension must register an input handler");
+
+  input({ text: "/skill:autoresearch-setup reduce build time" });
+  input({ text: "<skill name=\"autoresearch-setup\" location=\"/some/path\">…</skill>" });
+  input({ text: "/autoresearch start" });
+  input({ text: "unrelated prompt" });
+
+  assert.ok(activeTools.length >= 2, "setup invocations must activate the configure tool");
+  assert.ok(activeTools.every((tools) => tools.includes("autoresearch_configure")));
+  assert.equal(activeTools.length, 2, "non-setup input must not reactivate the tool");
+});
+
 test("ConfigurationError remains an explicit caller contract", () => {
   assert.equal(new ConfigurationError("bad setup").name, "ConfigurationError");
 });
