@@ -140,6 +140,12 @@ console.log(JSON.stringify({ type: "tool_result_end", message: { toolName: "cand
 
   assert.equal(result.node.outcome, "pending");
   assert.match(result.worker.stdout, /Output truncated:.*Full output:/);
+  const workerLogDirectory = join(repository.root, ".frontier-autoresearch", "logs");
+  assert.ok(result.worker.stdout.includes(join(workerLogDirectory, "candidate-1.stdout.log")));
+  assert.match(await readFile(join(workerLogDirectory, "candidate-1.stdout.log"), "utf8"), /diagnostic-/);
+  assert.equal(await readFile(join(workerLogDirectory, "candidate-1.stderr.log"), "utf8"), "");
+  const formerSiblingDirectory = [".pi", "frontier-autoresearch"].join("-");
+  await assert.rejects(() => access(join(repository.root, formerSiblingDirectory)));
   assert.deepEqual(result.worker.process, reportedProcess);
   assert.ok(reportedProcess && reportedProcess.processGroupId > 0 && reportedProcess.leaderPid > 0);
   assert.match(reportedProcess?.leaderStartIdentity ?? "", /^(linux:|darwin-token:)/);
@@ -187,8 +193,8 @@ import fs from "node:fs";
 import path from "node:path";
 fs.writeFileSync(path.join(process.cwd(), "protected.txt"), "bypassed\\n");
 fs.writeFileSync(path.join(process.cwd(), "outside.txt"), "bypassed\\n");
-fs.mkdirSync(path.join(process.cwd(), ".pi-frontier-autoresearch"), { recursive: true });
-fs.writeFileSync(path.join(process.cwd(), ".pi-frontier-autoresearch", "state"), "bypassed\\n");
+fs.mkdirSync(path.join(process.cwd(), ".frontier-autoresearch"), { recursive: true });
+fs.writeFileSync(path.join(process.cwd(), ".frontier-autoresearch", "state"), "bypassed\\n");
 fs.writeFileSync(path.join(process.cwd(), ".git"), "bypassed\\n");
 console.log(JSON.stringify({ type: "tool_result_end", message: { toolName: "candidate_submit", details: { hypothesis: "bypass", change: "protected", expectedEffect: "none", reflection: "rejected" } } }));
 `);
@@ -202,7 +208,7 @@ console.log(JSON.stringify({ type: "tool_result_end", message: { toolName: "cand
 
   assert.equal(result.node.outcome, "failed");
   assert.match(result.reason ?? "", /\.git \(Git metadata is protected/);
-  assert.match(result.reason ?? "", /\.pi-frontier-autoresearch.*Run state is protected/);
+  assert.match(result.reason ?? "", /\.frontier-autoresearch.*Run state is protected/);
   assert.match(result.reason ?? "", /outside\.txt.*outside the editable scope/);
   assert.match(result.reason ?? "", /protected\.txt.*Protected path cannot be changed/);
   assert.equal(await git(repository.root, "show", `${result.node.commit}:protected.txt`), "fixed");
@@ -323,7 +329,7 @@ test("worker confinement rejects escapes and allows scoped edits, moves, deletes
     worktree: root,
     editableGlobs: ["src/**"],
     protectedPaths: ["src/protected.ts", "protected.txt"],
-    runStatePaths: [".pi-frontier-autoresearch"],
+    runStatePaths: [".frontier-autoresearch"],
     probes: [{ name: "syntax", description: "Syntax", command: "check", timeoutMs: 100 }],
   });
 
@@ -345,7 +351,7 @@ test("worker confinement rejects escapes and allows scoped edits, moves, deletes
     ".git/config",
     "src/.git/config",
     "src/.GIT/config",
-    ".pi-frontier-autoresearch/events.jsonl",
+    ".frontier-autoresearch/events.jsonl",
     "../outside.ts",
     "src/../../outside.ts",
     join(outside, "absolute.ts"),
@@ -572,7 +578,7 @@ console.log(JSON.stringify({ type: "tool_result_end", message: { toolName: "cand
 
   const cancellation = new AbortController();
   const cancelledPromise = create("cancel", 2_000, cancellation.signal);
-  const started = join(repository.root, ".pi-frontier-autoresearch", "worktrees", "cancel", "src", "started");
+  const started = join(repository.root, ".frontier-autoresearch", "worktrees", "cancel", "src", "started");
   for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
       await access(started);

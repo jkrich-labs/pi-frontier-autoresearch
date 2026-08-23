@@ -6,6 +6,14 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import test from "node:test";
 
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+import { registerFrontierAutoresearch } from "../extensions/pi-frontier-autoresearch/index.ts";
+import {
+  detectAutoresearchCommandConflict,
+  type CommandProvenance,
+} from "../src/command-conflict.ts";
+
 const packageRoot = resolve(import.meta.dirname, "..");
 const packageName = "pi-frontier-autoresearch";
 const fixtureArtifact = "examples/generic-fixture/src/artifact.txt";
@@ -228,6 +236,43 @@ function assertExtensionCommands(commands: readonly RpcCommand[], root: string, 
   }
 }
 
+async function assertActualProvenanceConflict(commands: readonly RpcCommand[]): Promise<void> {
+  const actual = commands.find((command) => command.name === "autoresearch");
+  assert.ok(actual?.source && actual.sourceInfo?.source && actual.sourceInfo.path, JSON.stringify(commands));
+  const ours = actual as CommandProvenance;
+  const legacy: CommandProvenance = {
+    name: "autoresearch:1",
+    source: "extension",
+    sourceInfo: {
+      source: "pi-autoresearch",
+      path: "/actual/legacy/pi-autoresearch/index.ts",
+    },
+  };
+  const conflict = detectAutoresearchCommandConflict([legacy, ours]);
+  assert.deepEqual(conflict, {
+    ours: `${ours.sourceInfo.source} (${ours.sourceInfo.path})`,
+    other: `${legacy.sourceInfo.source} (${legacy.sourceInfo.path})`,
+  });
+  const handlers = new Map<string, (event: unknown, context: unknown) => Promise<void> | void>();
+  const warnings: string[] = [];
+  const fakePi = {
+    registerCommand() {},
+    registerTool() {},
+    getCommands: () => [legacy, ours],
+    on(event: string, handler: (event: unknown, context: unknown) => Promise<void> | void) {
+      handlers.set(event, handler);
+    },
+  } as unknown as ExtensionAPI;
+  registerFrontierAutoresearch(fakePi, () => { throw new Error("conflict must return before runtime creation"); });
+  await handlers.get("session_start")?.({}, {
+    mode: "tui",
+    ui: { notify(message: string, level: string) { if (level === "warning") warnings.push(message); } },
+  });
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0]?.includes(ours.sourceInfo.source), warnings[0]);
+  assert.ok(warnings[0]?.includes(legacy.sourceInfo.source), warnings[0]);
+}
+
 function scanForbiddenGuidance(root: string) {
   return spawnSync("grep", [
     "-RniE",
@@ -319,6 +364,10 @@ test("README documents a generic workflow with an explicit finite or unlimited b
     "Git with worktree support",
     "macOS or Linux",
     "no built-in ML behaviour, training",
+    "npm run verify",
+    "clean source checkout used to build the release artifact",
+    "published tarball intentionally excludes tests and tsconfig",
+    "Use `/autoresearch clear` before removing the package",
   ]) {
     assert.ok(readme.includes(required), `README is missing: ${required}`);
   }
@@ -338,6 +387,8 @@ test("package dry run has the exact sorted release manifest", () => {
   const result = pack(["--dry-run"]);
   const paths = result.files.map((file) => file.path).sort();
   assert.ok(paths.includes(fixtureArtifact), `missing packed fixture artifact: ${fixtureArtifact}`);
+  assert.equal(paths.length, 38, "the release artifact file count is an explicit criterion");
+  assert.ok(paths.every((path) => !path.startsWith("tests/") && path !== "tsconfig.json"));
   assert.deepEqual(paths, packedManifest, "packed files must exactly match the release manifest");
 });
 
@@ -352,6 +403,7 @@ test("direct source package installation loads its commands", async (t) => {
 
   const commands = await enumerateCommands(piBinary(), isolated.cwd, isolated.env);
   assertExtensionCommands(commands, packageRoot);
+  await assertActualProvenanceConflict(commands);
 });
 
 test("generated archive installs as an isolated Pi package and loads commands and skills without a model call", async (t) => {
@@ -373,6 +425,7 @@ test("generated archive installs as an isolated Pi package and loads commands an
 
   const commands = await enumerateCommands(piBinary(), isolated.cwd, isolated.env);
   assertExtensionCommands(commands, installedRoot, packageSpec);
+  await assertActualProvenanceConflict(commands);
   for (const name of ["skill:autoresearch-setup", "skill:autoresearch-worker"]) {
     const command = commands.find((candidate) => candidate.name === name);
     assert.ok(command, `skills were suppressed or undiscovered: ${JSON.stringify(commands)}`);

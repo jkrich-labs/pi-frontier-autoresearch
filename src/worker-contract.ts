@@ -2,6 +2,7 @@ import { Type } from "typebox";
 
 import type { WorktreeHandle } from "./adapters.ts";
 import type { Assignment, CandidateSubmission, ProbeSpec, RunSpec } from "./contracts.ts";
+import { LOCAL_RUN_DIRECTORY } from "./paths.ts";
 
 export const WORKER_TOOL_ALLOWLIST = [
   "read",
@@ -15,7 +16,7 @@ export const WORKER_TOOL_ALLOWLIST = [
 ] as const;
 
 export const LOCAL_RUN_STATE_PATHS = [
-  ".pi-frontier-autoresearch",
+  LOCAL_RUN_DIRECTORY,
   ".autoresearch",
   ".auto",
 ] as const;

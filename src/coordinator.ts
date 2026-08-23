@@ -159,6 +159,7 @@ export class RunCoordinator {
   #policyReviewAbort: AbortController | undefined;
   #policyReviewGroup: ProcessGroupIdentity | undefined;
   #disposedForRecovery = false;
+  #clearing = false;
   #mutationTail: Promise<void> = Promise.resolve();
 
   constructor(dependencies: RunCoordinatorDependencies) {
@@ -179,7 +180,13 @@ export class RunCoordinator {
 
   async configure(input: unknown, signal?: AbortSignal): Promise<ConfiguredRun> {
     return await this.#exclusive(async () => {
+      if (this.#clearing) throw new Error("Cannot configure while the current run is being cleared.");
       if (this.#loop) throw new Error("Stop the active run before configuring another run.");
+      const existing = await this.#store.load();
+      const hasArtifacts = await this.#store.hasRunArtifacts();
+      if (existing.events.length > 0 || existing.snapshot || hasArtifacts === true) {
+        throw new Error("Durable run state already exists; use /autoresearch clear before configuring another run.");
+      }
       const configured = await this.#configurator.configure(input, signal);
       await this.#loadUnlocked(true);
       return configured;
@@ -278,20 +285,72 @@ export class RunCoordinator {
     this.#disposedForRecovery = true;
   }
 
-  /** Clear state only after a caller has obtained an explicit confirmation. */
+  /** Clear owned processes, worktrees, refs, and state only after explicit confirmation. */
   async clear(confirmed = false): Promise<void> {
     if (!confirmed) throw new Error("Clear requires confirmation.");
-    const needsStop = await this.#exclusive(async () => {
-      await this.#loadUnlocked();
-      return ["running", "pausing", "stopping"].includes(this.#requireState().status);
-    });
-    if (needsStop) await this.stop("Run cleared by user.");
-    await this.#exclusive(async () => {
-      await this.#store.clear();
-      this.#state = undefined;
-      this.#events = [];
-      this.#wallStartedAt = undefined;
-    });
+    if (this.#clearing) throw new Error("A clear is already in progress.");
+    // Set this before the first await so a racing start/resume cannot launch work.
+    this.#clearing = true;
+    const refused = () => new Error(
+      "Clear refused because worker ownership could not be confirmed; durable state was preserved.",
+    );
+    try {
+      const request = await this.#exclusive(async () => {
+        const loaded = await this.#store.load();
+        const hasReplayableState = loaded.events.length > 0 || loaded.snapshot !== undefined;
+        // StoreAdapter's mandatory inspection distinguishes a truly empty store
+        // from a crashed claim, partial state, or durable worker marker.
+        const hasArtifacts = hasReplayableState || await this.#store.hasRunArtifacts();
+        if (!hasArtifacts) {
+          this.#state = undefined;
+          this.#events = [];
+          this.#wallStartedAt = undefined;
+          return { alreadyEmpty: true, loop: undefined, group: undefined };
+        }
+
+        if (hasReplayableState) {
+          await this.#loadUnlocked(true);
+          const state = this.#requireState();
+          if (["running", "pausing"].includes(state.status)) {
+            await this.#appendUnlocked("stop-requested", { reason: "Run cleared by user." });
+          }
+        } else {
+          // A directory without replayable state is a durable, fail-closed partial
+          // claim. It is clearable only through the same ownership and cleanup path.
+          this.#state = undefined;
+          this.#events = [];
+          this.#wallStartedAt = undefined;
+        }
+        this.#workerAbort?.abort(new Error("Run cleared by user."));
+        this.#policyReviewAbort?.abort(new Error("Run cleared by user."));
+        return {
+          alreadyEmpty: false,
+          loop: this.#loop,
+          group: this.#workerGroup ?? this.#policyReviewGroup,
+        };
+      });
+      if (request.alreadyEmpty) return;
+      if (request.group && !await this.#terminateOwnedGroup(request.group)) throw refused();
+      if (request.loop) await request.loop;
+
+      await this.#exclusive(async () => {
+        const marker = await this.#store.readWorkerMarker();
+        if (marker && (!this.#state || !await this.#recoverWorkerOwnershipUnlocked(marker))) throw refused();
+        // Process ownership is confirmed before any worktree path or immutable ref
+        // can be touched. Unlike recover(), clear never reconciles or relaunches work.
+        await this.#workspace.recover();
+        if (!this.#workspace.clearRunRefs) {
+          throw new Error("Clear refused because namespaced Git ref cleanup is unavailable; durable state was preserved.");
+        }
+        await this.#workspace.clearRunRefs();
+        await this.#store.clear();
+        this.#state = undefined;
+        this.#events = [];
+        this.#wallStartedAt = undefined;
+      });
+    } finally {
+      this.#clearing = false;
+    }
   }
 
   /**
@@ -300,11 +359,12 @@ export class RunCoordinator {
    */
   async recover(): Promise<RunState> {
     return await this.#exclusive(async () => {
+      if (this.#clearing) throw new Error("Cannot recover while the current run is being cleared.");
       // An in-process loop already owns its worker and state. Reloading underneath it
       // would race its event append sequence; recovery is only for a fresh coordinator.
       if (this.#loop) return this.#statusUnlocked();
       await this.#loadUnlocked(true);
-      const marker = await this.#store.readWorkerMarker?.();
+      const marker = await this.#store.readWorkerMarker();
       if (marker && !await this.#recoverWorkerOwnershipUnlocked(marker)) return this.#statusUnlocked();
 
       // This is deliberately after marker ownership is terminated and confirmed. A
@@ -318,7 +378,7 @@ export class RunCoordinator {
       if (marker && (marker.kind === "policy-review"
         ? this.#policyReviewBoundaryRecorded(marker.reviewId ?? marker.experimentId)
         : this.#markerBoundariesRecorded(marker.experimentId))) {
-        await this.#store.clearWorkerMarker?.();
+        await this.#store.clearWorkerMarker();
       }
       if (["running", "pausing", "stopping"].includes(this.#requireState().status)) this.#launchUnlocked();
       return this.#statusUnlocked();
@@ -343,6 +403,7 @@ export class RunCoordinator {
   }
 
   async #startUnlocked(): Promise<RunState> {
+    if (this.#clearing) throw new Error("Cannot start work while the current run is being cleared.");
     const state = this.#requireState();
     if (state.status !== "configured" && state.status !== "paused") {
       throw new Error(`Cannot start a run that is ${state.status}.`);
@@ -656,7 +717,7 @@ export class RunCoordinator {
 
   async #nextLoopAction(): Promise<LoopAction> {
     return await this.#exclusive(async () => {
-      if (this.#disposedForRecovery) return "return";
+      if (this.#disposedForRecovery || this.#clearing) return "return";
       const state = this.#requireState();
       if (state.status === "stopping") {
         if (state.activeAssignment) return "continue";
@@ -722,6 +783,7 @@ export class RunCoordinator {
 
   async #reviewPolicy(): Promise<void> {
     const prepared = await this.#exclusive(async () => {
+      if (this.#clearing) return undefined;
       const state = this.#requireState();
       const trigger = this.#policyReviewTrigger();
       if (state.status !== "running" || state.activeAssignment || !trigger) return undefined;
@@ -755,10 +817,15 @@ export class RunCoordinator {
     };
     const persistMarker = async (next: WorkerMarker): Promise<void> => {
       marker = next;
-      await this.#store.writeWorkerMarker?.(marker);
+      await this.#store.writeWorkerMarker(marker);
     };
     try {
+      if (this.#clearing) return;
       await persistMarker(marker);
+      if (this.#clearing || prepared.abort.signal.aborted) {
+        clearMarker = true;
+        return;
+      }
       let outcome: PolicyReviewOutcome;
       try {
         outcome = await this.#policyReviewer.review(prepared.context, prepared.abort.signal, async (identity) => {
@@ -822,7 +889,7 @@ export class RunCoordinator {
     } finally {
       await this.#exclusive(async () => {
         if (this.#policyReviewAbort === prepared.abort) {
-          clearMarker = !this.#disposedForRecovery && this.#events.some((event) =>
+          clearMarker ||= !this.#disposedForRecovery && this.#events.some((event) =>
             event.type === "policy-review-finished" && event.data.reviewId === prepared.context.review.reviewId,
           );
           this.#policyReviewAbort = undefined;
@@ -831,7 +898,7 @@ export class RunCoordinator {
           this.#workerActiveTermination = undefined;
         }
       });
-      if (clearMarker) await this.#store.clearWorkerMarker?.();
+      if (clearMarker) await this.#store.clearWorkerMarker();
     }
   }
 
@@ -939,16 +1006,21 @@ export class RunCoordinator {
 
   async #runWorker(current: ActiveWorker): Promise<void> {
     const { assignment, parent, donor, abort } = current;
+    if (this.#clearing) return;
     let processGroupConfirmed = false;
     let clearMarker = false;
     let marker: WorkerMarker = { experimentId: assignment.experimentId };
     const persistMarker = async (next: WorkerMarker): Promise<void> => {
       marker = next;
-      await this.#store.writeWorkerMarker?.(marker);
+      await this.#store.writeWorkerMarker(marker);
     };
     try {
       await persistMarker(marker);
       if (this.#disposedForRecovery) return;
+      if (this.#clearing) {
+        clearMarker = true;
+        return;
+      }
       if (abort.signal.aborted || this.#requireState().status === "stopping") {
         await this.#closeInterruptedAssignment(assignment, parent, donor, "Stop requested before worker launch.");
         return;
@@ -1045,7 +1117,7 @@ export class RunCoordinator {
           const ownsProcessGroup = this.#workerGroup !== undefined;
           // A marker survives every candidate crash gap. It is clearable only after
           // full-group exit and both replayable worker and node boundaries exist.
-          clearMarker = !this.#disposedForRecovery &&
+          clearMarker ||= !this.#disposedForRecovery &&
             (!ownsProcessGroup || processGroupConfirmed) &&
             this.#markerBoundariesRecorded(assignment.experimentId);
           this.#workerAbort = undefined;
@@ -1054,7 +1126,7 @@ export class RunCoordinator {
           this.#workerActiveTermination = undefined;
         }
       });
-      if (clearMarker) await this.#store.clearWorkerMarker?.();
+      if (clearMarker) await this.#store.clearWorkerMarker();
     }
   }
 
@@ -1257,7 +1329,7 @@ export class RunCoordinator {
       });
       return false;
     }
-    await this.#store.writeWorkerMarker?.({ ...marker, processExited: true });
+    await this.#store.writeWorkerMarker({ ...marker, processExited: true });
     return true;
   }
 

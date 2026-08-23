@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { appendFile, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, appendFile, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -205,6 +205,51 @@ class LocalPosixBlockingWorker implements WorkerAdapter {
       ...(this.identity ? { process: this.identity } : {}),
       reason: result.cancelled ? "cancelled" : "local process exited",
     };
+  }
+}
+
+class ConcurrentConfigureProcess implements ProcessExecutor {
+  readonly #delegate: NodeProcessExecutor;
+  readonly #barrier: { arrived: number; ready: ReturnType<typeof deferred>; release: ReturnType<typeof deferred> };
+  shellRuns = 0;
+  calibrationRuns = 0;
+
+  constructor(
+    clock: ManualClock,
+    barrier: { arrived: number; ready: ReturnType<typeof deferred>; release: ReturnType<typeof deferred> },
+  ) {
+    this.#delegate = new NodeProcessExecutor(clock);
+    this.#barrier = barrier;
+  }
+
+  async run(request: ProcessRequest, signal?: AbortSignal): Promise<ProcessResult> {
+    if (request.command === "/bin/sh") {
+      this.shellRuns += 1;
+      if (this.shellRuns === 1) {
+        this.#barrier.arrived += 1;
+        if (this.#barrier.arrived === 2) this.#barrier.ready.resolve();
+        await this.#barrier.release.promise;
+      } else {
+        this.calibrationRuns += 1;
+      }
+    }
+    return await this.#delegate.run(request, signal);
+  }
+
+  isProcessGroupIdentityCurrent(identity: ProcessGroupIdentity): Promise<boolean> {
+    return this.#delegate.isProcessGroupIdentityCurrent(identity);
+  }
+
+  terminateOwnedProcessGroupAndWait(identity: ProcessGroupIdentity, timeoutMs: number): Promise<boolean> {
+    return this.#delegate.terminateOwnedProcessGroupAndWait(identity, timeoutMs);
+  }
+
+  terminateRecoveredProcessGroupAndWait(identity: ProcessGroupIdentity, timeoutMs: number): Promise<boolean> {
+    return this.#delegate.terminateRecoveredProcessGroupAndWait(identity, timeoutMs);
+  }
+
+  waitForProcessGroupExit(identity: ProcessGroupIdentity, timeoutMs: number): Promise<boolean> {
+    return this.#delegate.waitForProcessGroupExit(identity, timeoutMs);
   }
 }
 
@@ -457,8 +502,16 @@ class HangingAfterAppendStore implements StoreAdapter {
     this.#event = event;
   }
 
-  initialise(specification: RunSpec, state: import("../src/index.ts").RunState): Promise<void> {
-    return this.#delegate.initialise(specification, state);
+  claimInitialisation(specification: RunSpec): Promise<import("../src/index.ts").StoreInitialisationClaim> {
+    return this.#delegate.claimInitialisation(specification);
+  }
+
+  initialise(
+    specification: RunSpec,
+    state: import("../src/index.ts").RunState,
+    claim: import("../src/index.ts").StoreInitialisationClaim,
+  ): Promise<void> {
+    return this.#delegate.initialise(specification, state, claim);
   }
 
   writeGeneratedSpec(content: string): Promise<void> {
@@ -480,6 +533,10 @@ class HangingAfterAppendStore implements StoreAdapter {
 
   load(): Promise<{ events: readonly import("../src/index.ts").RunEvent[]; snapshot?: import("../src/index.ts").RunState }> {
     return this.#delegate.load();
+  }
+
+  hasRunArtifacts(): Promise<boolean> {
+    return this.#delegate.hasRunArtifacts();
   }
 
   clear(): Promise<void> {
@@ -508,8 +565,16 @@ class HangingWorkerMarkerStore implements StoreAdapter {
     this.#delegate = new LocalRunStore(root);
   }
 
-  initialise(specification: RunSpec, state: import("../src/index.ts").RunState): Promise<void> {
-    return this.#delegate.initialise(specification, state);
+  claimInitialisation(specification: RunSpec): Promise<import("../src/index.ts").StoreInitialisationClaim> {
+    return this.#delegate.claimInitialisation(specification);
+  }
+
+  initialise(
+    specification: RunSpec,
+    state: import("../src/index.ts").RunState,
+    claim: import("../src/index.ts").StoreInitialisationClaim,
+  ): Promise<void> {
+    return this.#delegate.initialise(specification, state, claim);
   }
 
   writeGeneratedSpec(content: string): Promise<void> {
@@ -526,6 +591,10 @@ class HangingWorkerMarkerStore implements StoreAdapter {
 
   load(): Promise<{ events: readonly import("../src/index.ts").RunEvent[]; snapshot?: import("../src/index.ts").RunState }> {
     return this.#delegate.load();
+  }
+
+  hasRunArtifacts(): Promise<boolean> {
+    return this.#delegate.hasRunArtifacts();
   }
 
   clear(): Promise<void> {
@@ -619,6 +688,76 @@ class BenchmarkWorker implements WorkerAdapter {
   }
 }
 
+test("concurrent coordinators atomically claim one empty local run before calibration", async (t) => {
+  const root = await repository();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const barrier = { arrived: 0, ready: deferred(), release: deferred() };
+  const clocks = [new ManualClock(1_000), new ManualClock(1_000)];
+  const processes = clocks.map((clock) => new ConcurrentConfigureProcess(clock, barrier));
+  const stores = [new LocalRunStore(root), new LocalRunStore(root)];
+  const runs = processes.map((processExecutor, index) => new RunCoordinator({
+    store: stores[index]!,
+    workspace: new GitWorkspaceAdapter({
+      repository: root,
+      runId: "coordinator-fixture",
+      processExecutor,
+    }),
+    worker: new FailingWorker(),
+    evaluator: trustedEvaluator({}),
+    clock: clocks[index]!,
+    processExecutor,
+  }));
+
+  const configuring = runs.map((run) => run.configure(spec(root)));
+  await barrier.ready.promise;
+  barrier.release.resolve();
+  const results = await Promise.allSettled(configuring);
+  const succeeded = results.filter((result) => result.status === "fulfilled");
+  const rejected = results.filter((result) => result.status === "rejected");
+  const resultDetail = results.map((result) => result.status === "fulfilled" ? "fulfilled" : String(result.reason)).join("\n");
+  assert.equal(succeeded.length, 1, resultDetail);
+  assert.equal(rejected.length, 1, resultDetail);
+  assert.match(String(rejected[0]?.reason), /durable run state already exists.*clear/i);
+  assert.equal(processes.reduce((total, process) => total + process.calibrationRuns, 0), 1);
+
+  const loaded = await new LocalRunStore(root).load();
+  assert.equal(loaded.events.length, 1);
+  assert.equal(loaded.events[0]?.type, "run-configured");
+  const persistedSpec = JSON.parse(await readFile(join(root, ".frontier-autoresearch", "config.json"), "utf8")) as RunSpec;
+  assert.deepEqual(persistedSpec, loaded.events[0]?.type === "run-configured" ? loaded.events[0].data.spec : undefined);
+  await assert.rejects(() => access(join(root, ".frontier-autoresearch", "initialising.json")));
+
+  const replayed = coordinator(root, new FailingWorker(), new ManualClock(2_000));
+  assert.equal((await replayed.recover()).status, "configured");
+});
+
+test("a crashed initialisation claim is fail-closed, clearable, and preserves uncertain markers", async (t) => {
+  const root = await repository();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const store = new LocalRunStore(root);
+  await store.claimInitialisation(spec(root));
+  assert.equal(await store.hasRunArtifacts(), true);
+  await assert.rejects(
+    () => coordinator(root, new FailingWorker(), new ManualClock(1_000)).configure(spec(root)),
+    /durable run state already exists.*clear/i,
+  );
+
+  const clearing = coordinator(root, new FailingWorker(), new ManualClock(1_000));
+  await clearing.clear(true);
+  assert.equal(await store.hasRunArtifacts(), false);
+  await clearing.clear(true);
+
+  await store.claimInitialisation(spec(root));
+  await store.writeWorkerMarker({ experimentId: "uncertain-initialisation" });
+  await assert.rejects(() => clearing.clear(true), /clear refused.*worker ownership.*preserved/i);
+  assert.equal(await store.hasRunArtifacts(), true);
+  assert.deepEqual(await store.readWorkerMarker(), { experimentId: "uncertain-initialisation" });
+
+  await writeFile(join(root, ".frontier-autoresearch", "worker.json"), "{corrupt marker");
+  await assert.rejects(() => clearing.clear(true), /Unexpected token|JSON/);
+  assert.equal(await store.hasRunArtifacts(), true, "corrupt ownership state must survive refused clear");
+});
+
 test("coordinator records an experiment boundary before a sequential worker launch", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "frontier-coordinator-red-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -657,6 +796,20 @@ test("coordinator records an experiment boundary before a sequential worker laun
   assert.equal(await git(root, "rev-parse", "HEAD"), mainBefore);
   assert.equal(await readFile(join(root, "source.txt"), "utf8"), "baseline\n");
   const events = (await new LocalRunStore(root).load()).events;
+  const originalEvents = structuredClone(events);
+  await assert.rejects(
+    () => coordinator.configure(spec(root)),
+    /durable run state already exists.*clear/i,
+  );
+  assert.deepEqual((await new LocalRunStore(root).load()).events, originalEvents);
+  const replayed = new RunCoordinator({
+    store: new LocalRunStore(root),
+    workspace: new GitWorkspaceAdapter({ repository: root, runId: "coordinator-fixture" }),
+    worker: new FailingWorker(),
+    evaluator: trustedEvaluator({}),
+    clock: new ManualClock(1_000),
+  });
+  assert.equal((await replayed.recover()).status, "completed", "the original history remains replayable");
   const failed = events.find((event) => event.type === "node-recorded" && event.experimentId === "experiment-0001");
   assert.equal(failed?.type, "node-recorded");
   if (failed?.type === "node-recorded") assert.equal(failed.data.node.outcome, "failed");
@@ -887,7 +1040,14 @@ test("command router uses a fake Pi, reports status, and requires confirmation b
   const root = await repository();
   t.after(() => rm(root, { recursive: true, force: true }));
   const configured = coordinator(root, new FailingWorker(), new ManualClock(1_000));
-  await configured.configure(configuredSpec(root, { maxExperiments: 1 }));
+  const reusableSpec = configuredSpec(root, { maxExperiments: 1 });
+  await configured.configure(reusableSpec);
+  await configured.start();
+  await waitFor(() => configured.status().status === "completed", "clear fixture completion");
+  const runNamespace = "refs/pi-frontier-autoresearch/coordinator-fixture/";
+  assert.notEqual(await git(root, "for-each-ref", "--format=%(refname)", runNamespace), "");
+  const outsideRef = "refs/pi-frontier-autoresearch/another-run/nodes/keep";
+  await git(root, "update-ref", outsideRef, await git(root, "rev-parse", "HEAD"));
 
   const commands = new Map<string, { handler: (args: string, context: unknown) => Promise<void> }>();
   const notices: Array<{ message: string; level: string }> = [];
@@ -913,13 +1073,33 @@ test("command router uses a fake Pi, reports status, and requires confirmation b
   };
 
   await commands.get("autoresearch")!.handler("status", context);
-  assert.match(notices.at(-1)!.message, /Run coordinator-fixture: configured/);
+  assert.match(notices.at(-1)!.message, /Run coordinator-fixture: completed/);
   await commands.get("autoresearch")!.handler("clear", context);
   assert.match(notices.at(-1)!.message, /Clear cancelled/);
   assert.ok((await eventLog(root)).length > 0);
   confirm = true;
   await commands.get("autoresearch")!.handler("clear", context);
   assert.equal((await eventLog(root)).length, 0);
+  assert.equal(await git(root, "for-each-ref", "--format=%(refname)", runNamespace), "");
+  assert.equal(await git(root, "rev-parse", "--verify", outsideRef), await git(root, "rev-parse", "HEAD"));
+  await assert.rejects(() => access(join(root, ".frontier-autoresearch")));
+  const formerSiblingDirectory = [".pi", "frontier-autoresearch"].join("-");
+  await assert.rejects(() => access(join(root, formerSiblingDirectory)));
+
+  await configured.clear(true);
+  await configured.clear(true);
+  assert.equal(await git(root, "rev-parse", "--verify", outsideRef), await git(root, "rev-parse", "HEAD"));
+  await assert.rejects(() => access(join(root, ".frontier-autoresearch")));
+  const alreadyEmpty = coordinator(root, new FailingWorker(), new ManualClock(1_500));
+  await alreadyEmpty.clear(true);
+  assert.equal(await git(root, "rev-parse", "--verify", outsideRef), await git(root, "rev-parse", "HEAD"));
+
+  const rerun = coordinator(root, new FailingWorker(), new ManualClock(2_000));
+  await rerun.configure(reusableSpec);
+  await rerun.start();
+  await waitFor(() => rerun.status().status === "completed", "same-runId rerun completion");
+  assert.equal(rerun.status().budgetUsage.experiments, 1);
+  assertExperimentLifecycle(await eventLog(root), "experiment-0001", false);
 });
 
 test("coordinator concurrent pause and stop lifecycle calls serialize run events without deadlocking the worker loop", async (t) => {
@@ -1059,6 +1239,13 @@ test("recovery fails closed for a worker marker without a process group", async 
   assert.equal(worker.calls, 0);
   assert.equal(cleanupCalls, 0);
   assert.deepEqual(await new LocalRunStore(root).readWorkerMarker(), { experimentId: "experiment-0001" });
+  await assert.rejects(
+    () => recovered.clear(true),
+    /clear refused.*worker ownership.*preserved/i,
+  );
+  assert.ok((await eventLog(root)).length > 0, "an unconfirmed marker must preserve durable history");
+  assert.deepEqual(await new LocalRunStore(root).readWorkerMarker(), { experimentId: "experiment-0001" });
+  assert.equal(cleanupCalls, 0);
   await assertCheckoutUnchanged(root, before);
 });
 
@@ -1309,6 +1496,14 @@ test("recovery refuses a reused process identity without signalling or cleaning"
   assert.deepEqual(processes.terminated, []);
   assert.equal(cleanupCalls, 0);
   assert.deepEqual(await new LocalRunStore(root).readWorkerMarker(), marker);
+  await assert.rejects(
+    () => recovered.clear(true),
+    /clear refused.*worker ownership.*preserved/i,
+  );
+  assert.deepEqual(processes.terminated, []);
+  assert.equal(cleanupCalls, 0);
+  assert.deepEqual(await new LocalRunStore(root).readWorkerMarker(), marker);
+  assert.ok((await eventLog(root)).length > 0);
 });
 
 test("stop fails closed when owned group exit cannot be confirmed", async (t) => {
@@ -1564,6 +1759,71 @@ test("real POSIX recovery confirms the owned group is gone before workspace clea
   }
   worker.release();
   await new Promise((resolve) => setTimeout(resolve, 25));
+
+  const clearRoot = await repository();
+  t.after(() => rm(clearRoot, { recursive: true, force: true }));
+  const clearProcess = new NodeProcessExecutor(new ManualClock(2_000));
+  const clearWorker = new LocalPosixBlockingWorker(clearProcess);
+  const clearInitial = new RunCoordinator({
+    store: new LocalRunStore(clearRoot),
+    workspace: new GitWorkspaceAdapter({ repository: clearRoot, runId: "coordinator-fixture", processExecutor: clearProcess }),
+    worker: clearWorker,
+    evaluator: trustedEvaluator({}),
+    clock: new ManualClock(2_000),
+    processExecutor: clearProcess,
+  });
+  const clearSpec = configuredSpec(clearRoot, { maxExperiments: 1 });
+  clearSpec.editableGlobs = ["source.txt", "src/**"];
+  await clearInitial.configure(clearSpec);
+  await clearInitial.start();
+  await waitFor(() => clearWorker.groupReported && clearWorker.identity !== undefined, "post-crash clear worker marker");
+  const clearIdentity = clearWorker.identity!;
+  await clearInitial.disposeForRecovery();
+  clearWorker.abandonForRecovery();
+
+  const clearWorkspace = new GitWorkspaceAdapter({ repository: clearRoot, runId: "coordinator-fixture", processExecutor: clearProcess });
+  const recoverBeforeClear = clearWorkspace.recover.bind(clearWorkspace);
+  let clearCleanupAfterExit = false;
+  clearWorkspace.recover = async () => {
+    try {
+      process.kill(-clearIdentity.processGroupId, 0);
+      assert.fail("clear cleaned worktrees while the post-crash worker group was live");
+    } catch (error) {
+      assert.equal((error as NodeJS.ErrnoException).code, "ESRCH");
+    }
+    clearCleanupAfterExit = true;
+    await recoverBeforeClear();
+  };
+  const clearMustNotLaunch = new ScriptedWorker();
+  const clearing = new RunCoordinator({
+    store: new LocalRunStore(clearRoot),
+    workspace: clearWorkspace,
+    worker: clearMustNotLaunch,
+    evaluator: trustedEvaluator({}),
+    clock: new ManualClock(2_000),
+    processExecutor: clearProcess,
+  });
+  try {
+    await clearing.clear(true);
+    assert.equal(clearCleanupAfterExit, true);
+    assert.equal(clearMustNotLaunch.calls, 0);
+    assert.equal((await eventLog(clearRoot)).length, 0);
+    try {
+      process.kill(-clearIdentity.processGroupId, 0);
+      assert.fail("post-crash worker process group survived clear");
+    } catch (error) {
+      assert.equal((error as NodeJS.ErrnoException).code, "ESRCH");
+    }
+  } finally {
+    try {
+      process.kill(-clearIdentity.processGroupId, "SIGTERM");
+      await waitForProcessGroupExit(clearIdentity.processGroupId, "post-crash clear fixture cleanup");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+    clearWorker.release();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 });
 
 test("policy tuning launches a policy review only after a documented stalled run", async (t) => {

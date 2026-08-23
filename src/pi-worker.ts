@@ -1,6 +1,6 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { ProcessExecutor, ProcessGroupIdentity, WorkerAdapter, WorkerOutcome, WorktreeHandle } from "./adapters.ts";
@@ -210,7 +210,12 @@ export class PiWorkerAdapter implements WorkerAdapter {
     stdout: string,
     stderr: string,
   ): Promise<{ stdout: string; stderr: string }> {
-    const directory = resolve(this.#options.logDirectory ?? resolve(worktree.path, "..", "..", "logs"));
+    const runDirectory = resolve(worktree.path, "..", "..");
+    const directory = resolve(this.#options.logDirectory ?? resolve(runDirectory, "logs"));
+    const relativeDirectory = relative(runDirectory, directory);
+    if (relativeDirectory === ".." || relativeDirectory.startsWith(`..${sep}`)) {
+      throw new Error("Raw worker logs must remain inside the local run directory");
+    }
     await mkdir(directory, { recursive: true });
     const paths = {
       stdout: resolve(directory, `${experimentId}.stdout.log`),

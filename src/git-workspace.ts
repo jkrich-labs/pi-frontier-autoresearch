@@ -8,7 +8,8 @@ import type {
   ProcessExecutor,
   WorktreeHandle,
 } from "./adapters.ts";
-import type { Assignment, NodeRecord } from "./contracts.ts";
+import { isGitRefSafeSlug, type Assignment, type NodeRecord } from "./contracts.ts";
+import { LOCAL_RUN_DIRECTORY } from "./paths.ts";
 import { NodeProcessExecutor } from "./process.ts";
 
 export interface GitWorkspaceOptions {
@@ -19,9 +20,7 @@ export interface GitWorkspaceOptions {
 }
 
 function validateRefPart(value: string, label: string): string {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) || value.endsWith(".")) {
-    throw new Error(`${label} is not safe for a Git ref: ${value}`);
-  }
+  if (!isGitRefSafeSlug(value)) throw new Error(`${label} is not safe for a Git ref: ${value}`);
   return value;
 }
 
@@ -108,9 +107,10 @@ export class GitWorkspaceAdapter implements GitWorkspacePort {
 
   constructor(options: GitWorkspaceOptions) {
     this.repository = resolve(options.repository);
-    this.runDirectory = resolve(options.runDirectory ?? resolve(this.repository, ".pi-frontier-autoresearch"));
-    if (!isWithin(this.repository, this.runDirectory)) {
-      throw new Error("The run directory must be inside the target repository");
+    const localRunDirectory = resolve(this.repository, LOCAL_RUN_DIRECTORY);
+    this.runDirectory = resolve(options.runDirectory ?? localRunDirectory);
+    if (this.runDirectory !== localRunDirectory) {
+      throw new Error(`Worktrees must remain under ${LOCAL_RUN_DIRECTORY}`);
     }
     this.runId = validateRefPart(options.runId, "runId");
     this.#process = options.processExecutor ?? new NodeProcessExecutor();
@@ -363,5 +363,18 @@ export class GitWorkspaceAdapter implements GitWorkspacePort {
       await this.remove({ path, experimentId, parentCommit: "" });
     }
     await this.#git(["worktree", "prune"]);
+  }
+
+  /** Atomically delete only immutable refs owned by this configured run. */
+  async clearRunRefs(): Promise<void> {
+    const namespace = `refs/pi-frontier-autoresearch/${this.runId}/`;
+    const output = await this.#git(["for-each-ref", "--format=%(refname)", namespace]);
+    const refs = output.split("\n").filter(Boolean);
+    if (refs.some((ref) => !ref.startsWith(namespace))) {
+      throw new Error("Git returned a ref outside the run namespace; refusing clear");
+    }
+    if (refs.length === 0) return;
+    const transaction = ["start", ...refs.map((ref) => `delete ${ref}`), "prepare", "commit", ""].join("\n");
+    await this.#git(["update-ref", "--stdin"], this.repository, { input: transaction });
   }
 }

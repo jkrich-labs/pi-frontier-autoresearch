@@ -2,6 +2,7 @@ import { lstat, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, matchesGlob, relative, resolve, sep, win32 } from "node:path";
 
 import type { ProbeSpec } from "./contracts.ts";
+import { LOCAL_RUN_DIRECTORY } from "./paths.ts";
 
 export interface WorkerConfinementOptions {
   worktree: string;
@@ -32,7 +33,7 @@ export class WorkerConfinement {
     this.worktree = resolve(options.worktree);
     this.editableGlobs = options.editableGlobs;
     this.protectedPaths = options.protectedPaths;
-    this.runStatePaths = options.runStatePaths ?? [".pi-frontier-autoresearch", ".autoresearch", ".auto"];
+    this.runStatePaths = options.runStatePaths ?? [LOCAL_RUN_DIRECTORY, ".autoresearch", ".auto"];
     this.probes = new Map((options.probes ?? []).map((probe) => [probe.name, probe]));
   }
 

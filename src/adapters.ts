@@ -86,17 +86,39 @@ export interface WorkerMarker {
   reason?: string;
 }
 
+export interface StoreInitialisationClaim {
+  /** Opaque capability tied to one durable filesystem claim. */
+  readonly token: string;
+}
+
 export interface StoreAdapter {
-  initialise(spec: RunSpec, state: RunState): Promise<void>;
+  /**
+   * Atomically reserve a truly empty durable store before baseline calibration.
+   * Production implementations must exclude other processes, not merely other
+   * calls in this process. An abandoned claim remains a durable artifact.
+   */
+  claimInitialisation(spec: RunSpec): Promise<StoreInitialisationClaim>;
+  /**
+   * Commit initial state under, and consume, the exact claim returned above.
+   * The claim is released only after the initial state is durable; failures leave
+   * an artifact that blocks configuration until an explicit clear.
+   */
+  initialise(spec: RunSpec, state: RunState, claim: StoreInitialisationClaim): Promise<void>;
   writeGeneratedSpec(content: string): Promise<void>;
   append(event: RunEvent): Promise<void>;
   snapshot(state: RunState): Promise<void>;
   load(): Promise<{ events: readonly RunEvent[]; snapshot?: RunState }>;
+  /**
+   * Return false only when no store-owned durable object exists. Partial state,
+   * initialisation claims, temporary files, and worker markers are artifacts.
+   * Implementations must reject when emptiness cannot be established.
+   */
+  hasRunArtifacts(): Promise<boolean>;
   clear(): Promise<void>;
-  /** Optional durable ownership marker used to recover an interrupted worker. */
-  writeWorkerMarker?(marker: WorkerMarker): Promise<void>;
-  readWorkerMarker?(): Promise<WorkerMarker | undefined>;
-  clearWorkerMarker?(): Promise<void>;
+  /** Durable ownership markers are mandatory and unreadable markers must reject. */
+  writeWorkerMarker(marker: WorkerMarker): Promise<void>;
+  readWorkerMarker(): Promise<WorkerMarker | undefined>;
+  clearWorkerMarker(): Promise<void>;
 }
 
 export interface WorktreeHandle {
@@ -139,6 +161,8 @@ export interface GitWorkspacePort {
   readNodeRecord(nodeId: string): Promise<NodeRecord>;
   remove(worktree: WorktreeHandle): Promise<void>;
   recover(): Promise<void>;
+  /** Delete immutable Git refs strictly within this workspace's run namespace. */
+  clearRunRefs?(): Promise<void>;
 }
 
 export interface WorkerOutcome {

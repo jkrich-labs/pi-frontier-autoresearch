@@ -344,6 +344,19 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim() !== "";
 }
 
+export const GIT_REF_SLUG_MAX_LENGTH = 64;
+
+/** Conservative one-component slug accepted anywhere this package constructs a Git ref. */
+export function isGitRefSafeSlug(value: string): boolean {
+  return value.length > 0 &&
+    value.length <= GIT_REF_SLUG_MAX_LENGTH &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) &&
+    !value.includes("..") &&
+    !value.includes("@{") &&
+    !value.endsWith(".") &&
+    !value.toLowerCase().endsWith(".lock");
+}
+
 function validateCommand(value: unknown, label: string, issues: string[]): value is CommandSpec {
   if (!isRecord(value) || !isNonEmptyString(value.command)) {
     issues.push(`${label} command must be non-empty`);
@@ -407,7 +420,14 @@ export function validateRunSpec(value: unknown): string[] {
   }
 
   if (value.schemaVersion !== 1) issues.push("schemaVersion must be 1");
-  for (const key of ["runId", "targetRepository", "objective", "primaryMetric"] as const) {
+  if (!isNonEmptyString(value.runId)) {
+    issues.push("runId must be a non-empty string");
+  } else if (!isGitRefSafeSlug(value.runId)) {
+    issues.push(
+      `runId must be a Git-ref-safe slug of 1-${GIT_REF_SLUG_MAX_LENGTH} ASCII letters, numbers, dots, underscores, or hyphens`,
+    );
+  }
+  for (const key of ["targetRepository", "objective", "primaryMetric"] as const) {
     if (!isNonEmptyString(value[key])) issues.push(`${key} must be a non-empty string`);
   }
 

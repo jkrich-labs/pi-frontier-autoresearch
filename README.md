@@ -104,11 +104,14 @@ Your evaluator and probes are trusted local commands, not a sandbox. Review
 them and the target repository before running a campaign, especially when they
 build or execute untrusted code.
 
-Run state is stored locally in `.frontier-autoresearch`; candidate worktrees are
-separate from your main checkout. After a Pi restart, worker interruption, or
-crash, use `/autoresearch resume`. The controller recovers at experiment
-boundaries. Use `/autoresearch clear` only when you no longer need the local
-history.
+Run state, candidate worktrees, and raw controller/worker logs all stay under
+`.frontier-autoresearch`; worktrees remain separate from your main checkout.
+After a Pi restart, worker interruption, or crash, use `/autoresearch resume`.
+The controller recovers at experiment boundaries. Use `/autoresearch clear`
+only when you no longer need the history: it confirms any crash-surviving worker
+has exited, removes stale worktrees and this run's immutable Git refs, then
+removes the local directory. Do not delete the directory by hand while a worker
+may still be live.
 
 ## Command conflict
 
@@ -127,9 +130,20 @@ It has no built-in ML behaviour, training, dataset management, or specialised
 hardware orchestration. It does not alter its controller, evaluator, guards,
 or budget during a run.
 
+## Developer verification
+
+Run `npm run verify` in a clean source checkout used to build the release artifact
+(the packed-source checkout for that artifact). It typechecks, runs the 99-test
+suite, and checks the exact 38-file package
+contents. The published tarball intentionally excludes tests and tsconfig under
+that explicit package-content criterion; verification happens in release source,
+not inside the runtime tarball.
+
 ## Remove
 
-Remove the same source that you installed:
+Use `/autoresearch clear` before removing the package if you also want to remove
+the current run's local history, worktrees, logs, and namespaced Git refs. Then
+remove the same source that you installed:
 
 ```bash
 pi remove npm:pi-frontier-autoresearch
@@ -137,9 +151,8 @@ pi remove npm:pi-frontier-autoresearch
 pi remove ./path/to/pi-frontier-autoresearch
 ```
 
-Removing the package does not delete run history. Delete
-`.frontier-autoresearch` from a target repository only after you have finished
-with its records.
+Removing the package does not delete run history or Git refs. If you keep the
+history, reinstall the same package source before using `/autoresearch clear`.
 
 ## Licence and sources
 

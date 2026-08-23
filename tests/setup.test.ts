@@ -16,14 +16,36 @@ import {
   type RunSpec,
   type RunState,
   type StoreAdapter,
+  type StoreInitialisationClaim,
+  type WorkerMarker,
 } from "../src/index.ts";
+
+type Assert<T extends true> = T;
+type IsRequiredKey<T, K extends keyof T> = {} extends Pick<T, K> ? false : true;
+type _AtomicClaimIsRequired = Assert<IsRequiredKey<StoreAdapter, "claimInitialisation">>;
+type _ArtifactInspectionIsRequired = Assert<IsRequiredKey<StoreAdapter, "hasRunArtifacts">>;
+type _MarkerInspectionIsRequired = Assert<IsRequiredKey<StoreAdapter, "readWorkerMarker">>;
+type _MarkerWriteIsRequired = Assert<IsRequiredKey<StoreAdapter, "writeWorkerMarker">>;
+type _MarkerClearIsRequired = Assert<IsRequiredKey<StoreAdapter, "clearWorkerMarker">>;
+type _InitialiseConsumesRequiredClaim = Assert<
+  Parameters<StoreAdapter["initialise"]> extends [RunSpec, RunState, StoreInitialisationClaim] ? true : false
+>;
 
 class MemoryStore implements StoreAdapter {
   initial?: { spec: RunSpec; state: RunState };
   generatedSpec?: string;
+  claim?: StoreInitialisationClaim;
+  marker?: WorkerMarker;
 
-  async initialise(spec: RunSpec, state: RunState): Promise<void> {
+  async claimInitialisation(_spec: RunSpec): Promise<StoreInitialisationClaim> {
+    if (this.initial || this.claim) throw new Error("Durable run state already exists");
+    this.claim = { token: "memory-store-claim" };
+    return this.claim;
+  }
+  async initialise(spec: RunSpec, state: RunState, claim: StoreInitialisationClaim): Promise<void> {
+    if (claim !== this.claim) throw new Error("Initialisation claim does not belong to this store");
     this.initial = { spec, state };
+    this.claim = undefined;
   }
   async writeGeneratedSpec(content: string): Promise<void> {
     this.generatedSpec = content;
@@ -33,7 +55,23 @@ class MemoryStore implements StoreAdapter {
   async load(): Promise<{ events: readonly RunEvent[]; snapshot?: RunState }> {
     return { events: [], snapshot: this.initial?.state };
   }
-  async clear(): Promise<void> {}
+  async hasRunArtifacts(): Promise<boolean> {
+    return this.initial !== undefined || this.claim !== undefined || this.marker !== undefined;
+  }
+  async clear(): Promise<void> {
+    this.initial = undefined;
+    this.claim = undefined;
+    this.marker = undefined;
+  }
+  async writeWorkerMarker(marker: WorkerMarker): Promise<void> {
+    this.marker = marker;
+  }
+  async readWorkerMarker(): Promise<WorkerMarker | undefined> {
+    return this.marker;
+  }
+  async clearWorkerMarker(): Promise<void> {
+    this.marker = undefined;
+  }
 }
 
 async function fixtureRepository(metricLine = "METRIC build_ms=100"): Promise<string> {
@@ -93,6 +131,17 @@ test("configure rejects invalid setup contracts before launch", async () => {
   const root = await fixtureRepository();
 
   await expectConfigurationError({ ...runSpec(root), editableGlobs: [] }, /editableGlobs/);
+  for (const runId of [
+    "two words",
+    "two..dots",
+    "name@{one",
+    "trailing.",
+    "name.lock",
+    "-leading",
+    "a".repeat(65),
+  ]) {
+    await expectConfigurationError({ ...runSpec(root), runId }, /runId must be a Git-ref-safe slug/);
+  }
   await expectConfigurationError(
     { ...runSpec(root), editableGlobs: ["src/**"], protectedPaths: ["src/generated/**"] },
     /overlaps protected path/,
@@ -201,6 +250,7 @@ test("configure calibrates and persists a generic build-time run", async () => {
   assert.equal(configured.state.baseline?.summaries.build_ms?.median, 100);
   assert.equal(configured.state.baseline?.summaries.build_ms?.medianAbsoluteDeviation, 0);
   assert.equal(store.initial?.state.status, "configured");
+  assert.equal(store.claim, undefined, "successful initialisation consumes its atomic claim");
   for (const text of [
     "Reduce build time",
     "build_ms",
@@ -220,6 +270,14 @@ test("configure calibrates and persists a generic build-time run", async () => {
   assert.match(configured.generatedSpec, /Configuration digest: [a-f0-9]{64}/);
   assert.equal(store.generatedSpec, configured.generatedSpec);
   assert.ok(configured.state.spec.protectedPaths.includes(".frontier-autoresearch/**"));
+
+  const original = structuredClone(store.initial);
+  await assert.rejects(
+    () => configurator.configure(spec),
+    /durable run state already exists.*clear/i,
+  );
+  assert.deepEqual(store.initial, original, "reconfiguration must preserve the original durable setup");
+  assert.equal(store.generatedSpec, configured.generatedSpec);
 });
 
 test("prompt commands invoke setup without starting a run", async () => {

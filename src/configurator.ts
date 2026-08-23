@@ -48,6 +48,7 @@ export class RunConfigurator {
     } catch (error) {
       throw new ConfigurationError(error instanceof Error ? error.message : "Run spec is invalid", { cause: error });
     }
+    await this.#requireNoDurableRun();
     const spec: RunSpec = {
       ...input,
       protectedPaths: [...new Set([...input.protectedPaths, LOCAL_RUN_GLOB])],
@@ -55,6 +56,10 @@ export class RunConfigurator {
     await this.#verifyRepository(spec, signal);
     this.#verifyScope(spec);
     await this.#dryRunCommands(spec, signal);
+    // LocalRunStore claims its empty directory atomically here, before the
+    // expensive baseline. Concurrent coordinators therefore cannot both
+    // calibrate and later race while overwriting one another's state.
+    const initialisationClaim = await this.#store.claimInitialisation(spec);
     const baseline = await this.#calibrate(spec, signal);
     this.#verifyBaselineGuards(spec, baseline);
     const initialPolicy = initialPolicyVersion(spec.frontierPolicy);
@@ -72,7 +77,7 @@ export class RunConfigurator {
       latestDecision: "Run configured; use /autoresearch start to begin experiments.",
     };
     const generatedSpec = renderRunSpec(spec, baseline);
-    await this.#store.initialise(spec, state);
+    await this.#store.initialise(spec, state, initialisationClaim);
     const configuredEvent = {
       index: 1,
       type: "run-configured" as const,
@@ -85,6 +90,22 @@ export class RunConfigurator {
     await this.#store.snapshot(persistedState);
     await this.#store.writeGeneratedSpec(generatedSpec);
     return { state: persistedState, generatedSpec };
+  }
+
+  async #requireNoDurableRun(): Promise<void> {
+    const existing = await this.#store.load().catch((error: unknown) => {
+      throw new ConfigurationError("Cannot verify whether durable run state already exists; clear it explicitly before configuring", {
+        cause: error,
+      });
+    });
+    const hasArtifacts = await this.#store.hasRunArtifacts().catch((error: unknown) => {
+      throw new ConfigurationError("Cannot verify whether durable run state already exists; clear it explicitly before configuring", {
+        cause: error,
+      });
+    });
+    if (existing.events.length > 0 || existing.snapshot || hasArtifacts === true) {
+      throw new ConfigurationError("Durable run state already exists; use /autoresearch clear before configuring another run");
+    }
   }
 
   async #verifyRepository(spec: RunSpec, signal?: AbortSignal): Promise<void> {

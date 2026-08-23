@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readdir, readFile, readlink, writeFile } from "node:fs/promises";
-import { matchesGlob, resolve } from "node:path";
+import { matchesGlob, relative, resolve, sep } from "node:path";
 
 import type { EvaluatorAdapter, GitWorkspacePort, ProcessExecutor, ProcessResult, WorktreeHandle } from "./adapters.ts";
 import type {
@@ -771,7 +771,12 @@ export class Evaluator implements EvaluatorAdapter {
   }
 
   async #captureLog(spec: RunSpec, label: string, result: ProcessResult): Promise<EvaluationLog> {
-    const directory = resolve(this.#logDirectory ?? resolve(spec.targetRepository, LOCAL_RUN_DIRECTORY, "logs"));
+    const runDirectory = resolve(spec.targetRepository, LOCAL_RUN_DIRECTORY);
+    const directory = resolve(this.#logDirectory ?? resolve(runDirectory, "logs"));
+    const relativeDirectory = relative(runDirectory, directory);
+    if (relativeDirectory === ".." || relativeDirectory.startsWith(`..${sep}`)) {
+      throw new Error("Evaluator logs must remain inside the local run directory");
+    }
     await mkdir(directory, { recursive: true });
     const safeLabel = label.replaceAll(/[^A-Za-z0-9._-]/g, "-");
     const fullLogPath = resolve(directory, `${String(++this.#logSequence).padStart(4, "0")}-${safeLabel}-${randomUUID()}.log`);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -489,7 +489,9 @@ async function writeActionState(root: string, status: RunState["status"], runId:
     activeAssignment: undefined,
     budgetUsage: { experiments: 1, wallTimeMs: 0, reportedCostUsd: 0 },
   });
-  await new LocalRunStore(root).initialise(spec, state);
+  const store = new LocalRunStore(root);
+  const claim = await store.claimInitialisation(spec);
+  await store.initialise(spec, state, claim);
 }
 
 test("widget extension reload reconstructs durable detailed status after old lifecycle shutdown", async (t) => {
@@ -559,15 +561,32 @@ test("command conflict is provenance-only and returns before filesystem or store
       return Reflect.get(target, property, receiver);
     },
   });
+  const packageSource = "npm:pi-frontier-autoresearch@file:/tmp/pi-frontier-autoresearch-0.1.0.tgz";
   const commands = [
     provenance("autoresearch:1", "pi-autoresearch", "/packages/pi-autoresearch/index.ts"),
-    provenance("autoresearch:2", "pi-frontier-autoresearch", "/packages/pi-frontier-autoresearch/extensions/pi-frontier-autoresearch/index.ts"),
+    provenance("autoresearch:2", packageSource, "/packages/pi-frontier-autoresearch/extensions/pi-frontier-autoresearch/index.ts"),
   ];
   const conflict = detectAutoresearchCommandConflict(commands);
   assert.deepEqual(conflict, {
-    ours: "pi-frontier-autoresearch (/packages/pi-frontier-autoresearch/extensions/pi-frontier-autoresearch/index.ts)",
+    ours: `${packageSource} (/packages/pi-frontier-autoresearch/extensions/pi-frontier-autoresearch/index.ts)`,
     other: "pi-autoresearch (/packages/pi-autoresearch/index.ts)",
   });
+  const localSource = "../../dev/local-package";
+  const localPath = resolve(import.meta.dirname, "../extensions/pi-frontier-autoresearch/index.ts");
+  assert.ok(detectAutoresearchCommandConflict([
+    provenance("autoresearch:1", "pi-autoresearch", "/packages/pi-autoresearch/index.ts"),
+    provenance("autoresearch:2", localSource, localPath),
+  ]));
+  for (const unrelated of [
+    "npm:pi-frontier-autoresearch-extra@file:/tmp/unrelated.tgz",
+    "npm:not-pi-frontier-autoresearch@1.0.0",
+    "pi-frontier-autoresearch-extra",
+  ]) {
+    assert.equal(detectAutoresearchCommandConflict([
+      provenance("autoresearch:1", unrelated, `/packages/${unrelated}/index.ts`),
+      provenance("autoresearch:2", "pi-autoresearch", "/packages/pi-autoresearch/index.ts"),
+    ]), undefined, unrelated);
+  }
   assert.ok(accesses.length > 0);
 
   const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<void> | void>();
@@ -615,7 +634,7 @@ test("command conflict is provenance-only and returns before filesystem or store
   assert.deepEqual(forbiddenPiAccesses, []);
   assert.deepEqual(forbiddenContextAccesses, []);
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0] ?? "", /pi-frontier-autoresearch/);
+  assert.match(warnings[0] ?? "", /npm:pi-frontier-autoresearch@file:/);
   assert.match(warnings[0] ?? "", /\/packages\/pi-frontier-autoresearch\/extensions\/pi-frontier-autoresearch\/index\.ts/);
   assert.match(warnings[0] ?? "", /pi-autoresearch/);
   assert.match(warnings[0] ?? "", /\/packages\/pi-autoresearch\/index\.ts/);
