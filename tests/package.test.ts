@@ -349,8 +349,12 @@ test("README documents a generic workflow with an explicit finite or unlimited b
   const readme = await readFile(join(packageRoot, "README.md"), "utf8");
   for (const required of [
     "pi install ./path/to/pi-frontier-autoresearch",
+    "pi install git:github.com/jkrich-labs/pi-frontier-autoresearch@v0.1.0",
     "pi install npm:pi-frontier-autoresearch@0.1.0",
     "/autoresearch-prompt Reduce build time",
+    "Keep the Pi session open while a run is active",
+    "Do not invoke the worker skill directly",
+    "Start, pause, resume, stop, and status recover durable state first",
     "METRIC name=value",
     "Every run requires an explicit budget choice",
     "An unlimited choice has no budget bound",
@@ -359,6 +363,8 @@ test("README documents a generic workflow with an explicit finite or unlimited b
     "/autoresearch pause",
     "/autoresearch resume",
     "/autoresearch clear",
+    "/autoresearch clear confirm",
+    "BEST, LEAN, and two DIVERSE slots",
     "pi-autoresearch",
     "Node.js 22.19.0 or later",
     "Git with worktree support",
