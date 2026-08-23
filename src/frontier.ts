@@ -8,6 +8,7 @@ import type {
   FrontierSlot,
   MetricDirection,
   NodeRecord,
+  PromotionGate,
 } from "./contracts.ts";
 
 export interface FrontierSelectionWeights {
@@ -395,6 +396,34 @@ export class FrontierController {
     };
   }
 
+  /**
+   * Return a pure gate bound to a validated, replayable frontier history.
+   * The gate snapshots its input history so a later caller mutation cannot change the
+   * decision made between initial measurement and paired confirmation.
+   */
+  createPromotionGate(history: readonly FrontierEvent[]): PromotionGate {
+    const replayableHistory = structuredClone(history);
+    this.replay(replayableHistory);
+    return ({ candidate, initialEvaluation }) => this.previewPromotion(
+      replayableHistory,
+      candidate,
+      initialEvaluation,
+    ).role;
+  }
+
+  /**
+   * Calculate the frontier role a guard-valid initial evaluation would occupy without
+   * recording an event. Confirmation remains mandatory for recordEvaluation.
+   */
+  previewPromotion(
+    history: readonly FrontierEvent[],
+    candidate: NodeRecord,
+    initialEvaluation: Evaluation,
+  ): FrontierEvaluationDecision {
+    const provisionalEvaluation = this.provisionallyConfirm(initialEvaluation, candidate.id);
+    return this.recordEvaluation(history, { node: candidate, evaluation: provisionalEvaluation }).decision;
+  }
+
   recordEvaluation(
     history: readonly FrontierEvent[],
     input: RecordEvaluationInput,
@@ -438,6 +467,15 @@ export class FrontierController {
     const snapshot = this.replay(history);
     if (!snapshot.policy) throw new Error("fixed policy must be recorded before frontier events");
     return this.planAssignment(snapshot, history, input);
+  }
+
+  private provisionallyConfirm(evaluation: Evaluation, nodeId: string): Evaluation {
+    const guardValid =
+      evaluation.nodeId === nodeId &&
+      evaluation.scopeValid &&
+      evaluation.protectedPathsIntact &&
+      evaluation.guards.every((guard) => guard.status === "passed");
+    return guardValid ? { ...evaluation, confirmed: true } : evaluation;
   }
 
   private snapshot(

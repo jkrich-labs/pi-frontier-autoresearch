@@ -2,6 +2,7 @@ export * from "./adapters.ts";
 export * from "./candidate.ts";
 export * from "./clock.ts";
 export * from "./configurator.ts";
+export * from "./evaluator.ts";
 export * from "./contracts.ts";
 export * from "./frontier.ts";
 export * from "./git-workspace.ts";

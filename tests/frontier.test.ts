@@ -152,6 +152,26 @@ function closeFailedAssignment(
   });
 }
 
+test("promotion gate previews guard-valid initial evidence without changing replay history", () => {
+  const frontier = controller();
+  let history: FrontierEvent[] = [];
+  history = add(frontier, history, node("preview-root", "baseline", ["src/root.ts"], 10), 100);
+  const assignment = frontier.nextAssignment(history, { experimentId: "preview-assignment" });
+  history.push(assignment);
+  const candidateNode = node("preview-candidate", assignment.assignment, ["src/candidate.ts"], 1);
+  const initial = evaluation(candidateNode.id, 101, { confirmed: false });
+  const before = structuredClone(history);
+
+  const gate = frontier.createPromotionGate(history);
+  assert.equal(gate({ candidate: candidateNode, initialEvaluation: initial }), "BEST");
+  assert.equal(gate({
+    candidate: candidateNode,
+    initialEvaluation: { ...initial, guards: [{ name: "correctness", status: "failed" }] },
+  }), undefined);
+  assert.deepEqual(history, before);
+  assert.equal(frontier.recordEvaluation(history, { node: candidateNode, evaluation: initial }).decision.promoted, false);
+});
+
 test("frontier promotion recalculates unique BEST, LEAN, and DIVERSE roles", () => {
   const frontier = controller({ costMetric: "cost", costDirection: "lower" });
   let history: FrontierEvent[] = [];

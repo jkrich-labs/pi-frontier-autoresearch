@@ -4,11 +4,11 @@ import type { Clock, ProcessExecutor, StoreAdapter } from "./adapters.ts";
 import {
   assertRunSpec,
   type BaselineRecord,
-  type MetricSummary,
   type RunSpec,
   type RunState,
 } from "./contracts.ts";
-import { MetricParseError, parseMetricOutput, summariseSamples } from "./metrics.ts";
+import { Evaluator } from "./evaluator.ts";
+import { MetricParseError, parseMetricOutput } from "./metrics.ts";
 import { LOCAL_RUN_GLOB } from "./paths.ts";
 import { renderRunSpec } from "./run-spec.ts";
 
@@ -116,35 +116,13 @@ export class RunConfigurator {
   }
 
   async #calibrate(spec: RunSpec, signal?: AbortSignal): Promise<BaselineRecord> {
-    const samples = Object.fromEntries(spec.metrics.map((metric) => [metric.name, [] as number[]]));
-    let successful = 0;
-    for (let index = 0; index < spec.baseline.samples; index += 1) {
-      const result = await this.#runCommand(spec, spec.evaluator, signal);
-      if (result.exitCode !== 0) continue;
-      const metrics = this.#parseMetrics(spec, result.stdout);
-      if (metrics[spec.primaryMetric] === undefined) continue;
-      successful += 1;
-      for (const metric of spec.metrics) {
-        const value = metrics[metric.name];
-        if (value !== undefined) samples[metric.name]!.push(value);
-      }
+    const calibration = await new Evaluator({ commandExecutor: this.#commandExecutor }).calibrate(spec, signal);
+    if (calibration.guards.some((guard) => guard.name === "evaluator" && guard.status === "failed")) {
+      throw new ConfigurationError(calibration.reason);
     }
-    if (successful === 0) throw new ConfigurationError("Baseline produced zero successful baseline samples");
-    if (successful !== spec.baseline.samples) {
-      throw new ConfigurationError(
-        `Baseline collected ${successful} of ${spec.baseline.samples} required samples`,
-      );
-    }
-    for (const metric of spec.metrics) {
-      if (samples[metric.name]!.length !== successful) {
-        throw new ConfigurationError(`Baseline did not emit metric "${metric.name}" for every successful sample`);
-      }
-    }
-    const summaries: Record<string, MetricSummary> = {};
-    for (const [name, values] of Object.entries(samples)) summaries[name] = summariseSamples(values);
     return {
-      samples,
-      summaries,
+      samples: calibration.samples,
+      summaries: calibration.summaries,
       calibratedAt: new Date(this.#clock.now()).toISOString(),
     };
   }

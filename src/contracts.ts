@@ -112,6 +112,33 @@ export interface GuardResult {
   detail?: string;
 }
 
+export interface EvaluationLog {
+  label: string;
+  exitCode: number | null;
+  durationMs: number;
+  timedOut: boolean;
+  cancelled: boolean;
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+  fullLogPath: string;
+}
+
+export interface ConfirmationEvidence {
+  parentNodeId: string;
+  promotionRole: FrontierRole;
+  pairedSamples: readonly {
+    parent: Readonly<Record<string, number>>;
+    candidate: Readonly<Record<string, number>>;
+  }[];
+  outcome: "confirmed" | "rejected" | "exhausted" | "failed";
+}
+
+export interface EvaluationEvidence {
+  logs: readonly EvaluationLog[];
+  confirmation?: ConfirmationEvidence;
+}
+
 export interface Evaluation {
   nodeId: string;
   samples: Readonly<Record<string, readonly number[]>>;
@@ -122,7 +149,16 @@ export interface Evaluation {
   confirmationAttempted: boolean;
   confirmed: boolean;
   reason: string;
+  evidence?: EvaluationEvidence;
 }
+
+export interface PromotionGateInput {
+  candidate: NodeRecord;
+  initialEvaluation: Evaluation;
+}
+
+/** The frontier owns this role decision; the evaluator only schedules confirmation. */
+export type PromotionGate = (input: PromotionGateInput) => FrontierRole | undefined;
 
 export interface CandidateSubmission {
   hypothesis: string;

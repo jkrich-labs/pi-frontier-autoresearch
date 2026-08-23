@@ -3,6 +3,7 @@ import type {
   CandidateSubmission,
   Evaluation,
   NodeRecord,
+  PromotionGate,
   RunEvent,
   RunSpec,
   RunState,
@@ -112,6 +113,7 @@ export interface EvaluatorAdapter {
     spec: RunSpec,
     candidate: NodeRecord,
     parent: NodeRecord,
+    promotionGate: PromotionGate,
     signal?: AbortSignal,
   ): Promise<Evaluation>;
 }
