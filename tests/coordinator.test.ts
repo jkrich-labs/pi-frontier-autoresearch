@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { appendFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
@@ -15,6 +15,7 @@ import {
   LocalRunStore,
   ManualClock,
   NodeProcessExecutor,
+  PolicyReviewer,
   RunCommandRouter,
   RunCoordinator,
   type Evaluation,
@@ -389,6 +390,7 @@ function coordinator(
     evaluator?: EvaluatorAdapter;
     processExecutor?: ProcessExecutor;
     store?: StoreAdapter;
+    policyReviewer?: import("../src/index.ts").PolicyReviewerAdapter;
   } = {},
 ): RunCoordinator {
   const processExecutor = options.processExecutor ?? new NodeProcessExecutor(clock);
@@ -404,6 +406,7 @@ function coordinator(
     evaluator: options.evaluator ?? trustedEvaluator({}),
     clock,
     processExecutor,
+    policyReviewer: options.policyReviewer,
   });
 }
 
@@ -1561,4 +1564,393 @@ test("real POSIX recovery confirms the owned group is gone before workspace clea
   }
   worker.release();
   await new Promise((resolve) => setTimeout(resolve, 25));
+});
+
+test("policy tuning launches a policy review only after a documented stalled run", async (t) => {
+  const root = await repository();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const clock = new ManualClock(1_000);
+  const reviewer = {
+    calls: 0,
+    async review() {
+      this.calls += 1;
+      return {
+        status: "proposed" as const,
+        stdout: "",
+        stderr: "",
+        proposal: {
+          rationale: "Explore a little more novelty after repeated non-promotions.",
+          changes: { noveltyWeight: 0.5 },
+        },
+      };
+    },
+  };
+  const runSpec = configuredSpec(root, { maxExperiments: 4 });
+  runSpec.editableGlobs = ["source.txt", "src/**"];
+  runSpec.policyTuning = { enabled: true };
+  const run = new RunCoordinator({
+    store: new LocalRunStore(root),
+    workspace: new GitWorkspaceAdapter({ repository: root, runId: "coordinator-fixture" }),
+    worker: new ScriptedWorker(),
+    evaluator: trustedEvaluator({
+      "experiment-0001": 80,
+      "experiment-0002": 80,
+      "experiment-0003": 80,
+      "experiment-0004": 80,
+    }),
+    clock,
+    policyReviewer: reviewer,
+  } as unknown as import("../src/index.ts").RunCoordinatorDependencies);
+
+  await run.configure(runSpec);
+  await run.start();
+  await waitFor(() => ["completed", "failed"].includes(run.status().status), "stalled policy-tuning fixture completion");
+
+  assert.equal(run.status().status, "completed", JSON.stringify(run.status()));
+  assert.equal(reviewer.calls, 1);
+  const events = await eventLog(root);
+  const proposed = events.filter((event) => event.type === "policy-proposed");
+  const updated = events.filter((event) => event.type === "policy-updated");
+  assert.equal(proposed.length, 1);
+  assert.equal(updated.length, 1);
+  assert.equal(proposed[0]?.type, "policy-proposed");
+  if (proposed[0]?.type === "policy-proposed") {
+    assert.equal(proposed[0].data.accepted, true);
+    assert.deepEqual(proposed[0].data.proposal, {
+      rationale: "Explore a little more novelty after repeated non-promotions.",
+      changes: { noveltyWeight: 0.5 },
+    });
+  }
+  assert.equal(run.status().activePolicy.version, 2);
+  assert.equal(run.status().activePolicy.weights.novelty, 0.5);
+
+  const replayed = coordinator(root, new ScriptedWorker(), new ManualClock(1_000), {
+    evaluator: trustedEvaluator({}),
+    policyReviewer: reviewer,
+  });
+  const replayedState = await replayed.recover();
+  assert.deepEqual(replayedState.activePolicy, run.status().activePolicy);
+  assert.equal(replayedState.policyVersion, 2);
+
+  const rolledBack = await replayed.rollbackPolicy(1);
+  assert.equal(rolledBack.policyVersion, 3);
+  assert.equal(rolledBack.activePolicy.weights.novelty, 0.35);
+  const rollback = (await eventLog(root)).at(-1);
+  assert.equal(rollback?.type, "policy-rolled-back");
+  const replayedRollback = coordinator(root, new ScriptedWorker(), new ManualClock(1_000), {
+    evaluator: trustedEvaluator({}),
+    policyReviewer: reviewer,
+  });
+  assert.deepEqual((await replayedRollback.recover()).activePolicy, rolledBack.activePolicy);
+});
+
+test("policy review is disabled in fixed mode and rate-limited in opt-in mode", async (t) => {
+  const fixedRoot = await repository();
+  t.after(() => rm(fixedRoot, { recursive: true, force: true }));
+  const fixedReviewer = {
+    calls: 0,
+    async review() {
+      this.calls += 1;
+      return { status: "failed" as const, stdout: "", stderr: "" };
+    },
+  };
+  const fixedSpec = configuredSpec(fixedRoot, { maxExperiments: 4 });
+  fixedSpec.editableGlobs = ["source.txt", "src/**"];
+  const fixed = coordinator(fixedRoot, new ScriptedWorker(), new ManualClock(1_000), {
+    evaluator: trustedEvaluator({
+      "experiment-0001": 80,
+      "experiment-0002": 80,
+      "experiment-0003": 80,
+      "experiment-0004": 80,
+    }),
+    policyReviewer: fixedReviewer,
+  });
+  await fixed.configure(fixedSpec);
+  await fixed.start();
+  await waitFor(() => fixed.status().status === "completed", "fixed-mode completion");
+  assert.equal(fixedReviewer.calls, 0);
+  assert.equal((await eventLog(fixedRoot)).some((event) => event.type === "policy-review-recorded"), false);
+
+  const healthyRoot = await benchmarkRepository();
+  t.after(() => rm(healthyRoot, { recursive: true, force: true }));
+  const healthyReviewer = {
+    calls: 0,
+    async review() {
+      this.calls += 1;
+      return { status: "failed" as const, stdout: "", stderr: "" };
+    },
+  };
+  const healthySpec = configuredSpec(healthyRoot, { maxExperiments: 4 });
+  healthySpec.editableGlobs = ["source.txt", "src/**"];
+  healthySpec.policyTuning = { enabled: true };
+  const healthy = coordinator(healthyRoot, new BenchmarkWorker([101, 102, 103, 104]), new ManualClock(1_000), {
+    evaluator: trustedEvaluator({
+      "experiment-0001": 101,
+      "experiment-0002": 102,
+      "experiment-0003": 103,
+      "experiment-0004": 104,
+    }),
+    policyReviewer: healthyReviewer,
+  });
+  await healthy.configure(healthySpec);
+  await healthy.start();
+  await waitFor(() => ["completed", "failed"].includes(healthy.status().status), "healthy opt-in completion");
+  assert.equal(healthy.status().status, "completed", JSON.stringify(healthy.status()));
+  assert.equal(healthyReviewer.calls, 0);
+
+  const tunedRoot = await repository();
+  t.after(() => rm(tunedRoot, { recursive: true, force: true }));
+  const tunedReviewer = {
+    calls: 0,
+    async review() {
+      this.calls += 1;
+      return {
+        status: "proposed" as const,
+        stdout: "",
+        stderr: "",
+        proposal: {
+          rationale: `Bounded retry ${this.calls}`,
+          changes: { noveltyWeight: 0.35 + this.calls / 10 },
+        },
+      };
+    },
+  };
+  const tunedSpec = configuredSpec(tunedRoot, { maxExperiments: 7 });
+  tunedSpec.editableGlobs = ["source.txt", "src/**"];
+  tunedSpec.policyTuning = { enabled: true };
+  const tuned = coordinator(tunedRoot, new ScriptedWorker(), new ManualClock(1_000), {
+    evaluator: trustedEvaluator({
+      "experiment-0001": 80,
+      "experiment-0002": 80,
+      "experiment-0003": 80,
+      "experiment-0004": 80,
+      "experiment-0005": 80,
+      "experiment-0006": 80,
+      "experiment-0007": 80,
+    }),
+    policyReviewer: tunedReviewer,
+  });
+  await tuned.configure(tunedSpec);
+  await tuned.start();
+  await waitFor(() => ["completed", "failed"].includes(tuned.status().status), "rate-limited policy review completion");
+  assert.equal(tuned.status().status, "completed", JSON.stringify(tuned.status()));
+  assert.equal(tunedReviewer.calls, 2);
+  const reviews = (await eventLog(tunedRoot)).filter((event) => event.type === "policy-review-recorded");
+  assert.equal(reviews.length, 2);
+  assert.deepEqual(reviews.map((event) => event.type === "policy-review-recorded" ? event.data.review.trigger : undefined), [
+    "stall-no-promotions",
+    "stall-no-promotions",
+  ]);
+});
+
+test("policy review recognizes documented degeneration signals", async (t) => {
+  const root = await repository();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const reviewer = {
+    calls: 0,
+    async review() {
+      this.calls += 1;
+      return { status: "failed" as const, stdout: "", stderr: "", reason: "No bounded recommendation." };
+    },
+  };
+  const runSpec = configuredSpec(root, { maxExperiments: 4 });
+  runSpec.policyTuning = { enabled: true };
+  const run = coordinator(root, new FailingWorker(), new ManualClock(1_000), {
+    evaluator: trustedEvaluator({}),
+    policyReviewer: reviewer,
+  });
+  await run.configure(runSpec);
+  await run.start();
+  await waitFor(() => run.status().status === "completed", "degeneration policy-review completion");
+  assert.equal(reviewer.calls, 1);
+  const review = (await eventLog(root)).find((event) => event.type === "policy-review-recorded");
+  assert.equal(review?.type, "policy-review-recorded");
+  if (review?.type === "policy-review-recorded") {
+    assert.equal(review.data.review.trigger, "degeneration-terminal-outcomes");
+  }
+});
+
+test("policy review recovery terminates durable ownership before resuming at a boundary", async (t) => {
+  const root = await repository();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const clock = new ManualClock(1_000);
+  const processes = new RecordingProcess(clock);
+  const release = deferred();
+  const reviewer = {
+    started: false,
+    async review(
+      _context: import("../src/index.ts").PolicyReviewContext,
+      _signal?: AbortSignal,
+      onProcessGroup?: (identity: ProcessGroupIdentity) => void | Promise<void>,
+    ) {
+      this.started = true;
+      await onProcessGroup?.(processIdentity(654));
+      await release.promise;
+      return {
+        status: "proposed" as const,
+        stdout: "",
+        stderr: "",
+        proposal: { rationale: "Late proposal must not be persisted.", changes: { noveltyWeight: 0.5 } },
+      };
+    },
+  };
+  const runSpec = configuredSpec(root, { maxExperiments: 4 });
+  runSpec.editableGlobs = ["source.txt", "src/**"];
+  runSpec.policyTuning = { enabled: true };
+  const initial = coordinator(root, new ScriptedWorker(), clock, {
+    evaluator: trustedEvaluator({
+      "experiment-0001": 80,
+      "experiment-0002": 80,
+      "experiment-0003": 80,
+    }),
+    processExecutor: processes,
+    policyReviewer: reviewer,
+  });
+  await initial.configure(runSpec);
+  await initial.start();
+  await waitFor(() => reviewer.started || initial.status().status === "failed", "durable policy-review worker marker");
+  assert.equal(initial.status().status, "running", JSON.stringify(initial.status()));
+  await initial.disposeForRecovery();
+
+  const recoveredWorker = new ScriptedWorker();
+  const recovered = coordinator(root, recoveredWorker, new ManualClock(1_000), {
+    evaluator: trustedEvaluator({}),
+    processExecutor: processes,
+  });
+  await recovered.recover();
+  await waitFor(() => recovered.status().status === "completed", "policy-review recovery completion");
+  const events = await eventLog(root);
+  assert.deepEqual(processes.terminated, [654]);
+  assert.equal(recoveredWorker.calls, 1);
+  assert.equal(events.some((event) => event.type === "policy-proposed"), false);
+  const finished = events.find((event) => event.type === "policy-review-finished");
+  assert.equal(finished?.type, "policy-review-finished");
+  if (finished?.type === "policy-review-finished") assert.equal(finished.data.status, "cancelled");
+  assert.equal(await new LocalRunStore(root).readWorkerMarker(), undefined);
+  release.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+});
+
+test("rebuild rejects policy-update version gaps and accepted-proposal mismatches before frontier replay", async (t) => {
+  const root = await repository();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runSpec = configuredSpec(root, { maxExperiments: 4 });
+  runSpec.editableGlobs = ["source.txt", "src/**"];
+  runSpec.policyTuning = { enabled: true };
+  const run = coordinator(root, new ScriptedWorker(), new ManualClock(1_000), {
+    evaluator: trustedEvaluator({
+      "experiment-0001": 80,
+      "experiment-0002": 80,
+      "experiment-0003": 80,
+      "experiment-0004": 80,
+    }),
+    policyReviewer: {
+      async review() {
+        return {
+          status: "proposed" as const,
+          stdout: "",
+          stderr: "",
+          proposal: { rationale: "A bounded change.", changes: { noveltyWeight: 0.5 } },
+        };
+      },
+    },
+  });
+  await run.configure(runSpec);
+  await run.start();
+  await waitFor(() => run.status().status === "completed", "policy update fixture completion");
+  const original = await eventLog(root);
+
+  for (const mutate of [
+    (events: import("../src/index.ts").RunEvent[]) => {
+      const update = events.find((event) => event.type === "policy-updated");
+      assert.equal(update?.type, "policy-updated");
+      if (update?.type === "policy-updated") {
+        update.data.version = 3;
+        update.data.policy.version = 3;
+      }
+    },
+    (events: import("../src/index.ts").RunEvent[]) => {
+      const update = events.find((event) => event.type === "policy-updated");
+      assert.equal(update?.type, "policy-updated");
+      if (update?.type === "policy-updated") update.data.previousVersion = 0;
+    },
+  ]) {
+    const tampered = structuredClone(original) as import("../src/index.ts").RunEvent[];
+    mutate(tampered);
+    await writeFile(
+      join(root, ".frontier-autoresearch", "events.jsonl"),
+      `${tampered.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    );
+    await assert.rejects(
+      () => coordinator(root, new ScriptedWorker(), new ManualClock(1_000)).recover(),
+      /policy update.*version|policy update does not match/i,
+    );
+  }
+});
+
+test("production policy guard and reviewer durably reject forbidden, unknown, out-of-range, and invariant-breaking submissions", async (t) => {
+  const fixtureDirectory = await mkdtemp(join(tmpdir(), "frontier-policy-review-guarded-"));
+  t.after(() => rm(fixtureDirectory, { recursive: true, force: true }));
+  const fixture = join(fixtureDirectory, "pi");
+  const script = join(fixtureDirectory, "guarded-reviewer.ts");
+  await writeFile(fixture, `#!/bin/sh
+exec ${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(script)} "$@"
+`);
+  await chmod(fixture, 0o755);
+  const guardPath = resolve(process.cwd(), "extensions/pi-frontier-autoresearch/policy-review-guard.ts");
+  const proposals: Readonly<Record<string, unknown>> = {
+    malformed: null,
+    evaluator: { rationale: "Do not do this", changes: { noveltyWeight: 0.5 }, evaluator: "other command" },
+    guards: { rationale: "Do not do this", changes: { noveltyWeight: 0.5 }, guards: [] },
+    budget: { rationale: "Do not do this", changes: { noveltyWeight: 0.5 }, budget: { unlimited: true } },
+    frontierSize: { rationale: "Do not do this", changes: { noveltyWeight: 0.5 }, frontierSize: 8 },
+    code: { rationale: "Do not do this", changes: { noveltyWeight: 0.5 }, code: "rewrite controller" },
+    unknown: { rationale: "Unknown tunable", changes: { unknownWeight: 1 } },
+    outOfRange: { rationale: "Unsafe value", changes: { noveltyWeight: 3 } },
+    invariant: { rationale: "Break cadence invariant", changes: { crossoverCadence: 1.5 } },
+  };
+  for (const [name, proposal] of Object.entries(proposals)) {
+    const root = await repository();
+    t.after(() => rm(root, { recursive: true, force: true }));
+    await writeFile(script, `
+import policyReviewGuard from ${JSON.stringify(guardPath)};
+const tools = new Map();
+policyReviewGuard({
+  registerTool(tool) { tools.set(tool.name, tool); },
+  on() {},
+  setActiveTools() {},
+});
+const result = await tools.get("policy_review_submit").execute("fixture", ${JSON.stringify(proposal)});
+console.log(JSON.stringify({ type: "tool_result_end", message: { toolName: "policy_review_submit", details: result.details } }));
+`);
+    const reviewer = new PolicyReviewer({ executable: fixture, timeoutMs: 2_000 });
+    const runSpec = configuredSpec(root, { maxExperiments: 4 });
+    runSpec.editableGlobs = ["source.txt", "src/**"];
+    runSpec.policyTuning = { enabled: true };
+    const run = coordinator(root, new ScriptedWorker(), new ManualClock(1_000), {
+      evaluator: trustedEvaluator({
+        "experiment-0001": 80,
+        "experiment-0002": 80,
+        "experiment-0003": 80,
+        "experiment-0004": 80,
+      }),
+      policyReviewer: reviewer,
+    });
+    await run.configure(runSpec);
+    await run.start();
+    await waitFor(() => ["completed", "failed"].includes(run.status().status), `${name} rejection completion`);
+    assert.equal(run.status().status, "completed", name);
+    assert.equal(run.status().policyVersion, 1, name);
+    const events = await eventLog(root);
+    const rejected = events.filter((event) => event.type === "policy-proposed");
+    assert.equal(rejected.length, 1, name);
+    assert.equal(rejected[0]?.type, "policy-proposed");
+    if (rejected[0]?.type === "policy-proposed") {
+      assert.equal(rejected[0].data.accepted, false, name);
+      assert.equal((rejected[0].data.proposal as { kind?: string }).kind, "policy-proposal-rejected", name);
+      assert.ok(Buffer.byteLength(JSON.stringify(rejected[0].data.proposal)) < 2_048, name);
+      assert.match(rejected[0].data.reason, /object|unknown|within|integer/i, name);
+    }
+    assert.equal(events.some((event) => event.type === "policy-updated"), false, name);
+  }
 });

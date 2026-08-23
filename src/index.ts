@@ -11,6 +11,8 @@ export * from "./git-workspace.ts";
 export * from "./metrics.ts";
 export * from "./paths.ts";
 export * from "./pi-worker.ts";
+export * from "./policy-reviewer.ts";
+export * from "./policy-tuning.ts";
 export * from "./process.ts";
 export * from "./run-spec.ts";
 export * from "./store.ts";

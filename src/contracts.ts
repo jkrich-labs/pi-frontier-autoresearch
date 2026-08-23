@@ -74,6 +74,31 @@ export interface FrontierPolicy {
   crossoverCadence: number;
 }
 
+/** The only search-selection weights that an opt-in policy review may tune. */
+export interface FrontierSelectionWeights {
+  productivity: number;
+  exploration: number;
+  novelty: number;
+  coverage: number;
+  recency: number;
+  pairRepetitionPenalty: number;
+}
+
+/** Immutable, replayable search-policy snapshot. Evaluation and safety contracts are deliberately absent. */
+export interface FrontierPolicyVersion {
+  version: number;
+  frontier: FrontierPolicy;
+  weights: FrontierSelectionWeights;
+}
+
+export type PolicyReviewTrigger = "stall-no-promotions" | "degeneration-terminal-outcomes";
+
+export interface PolicyReviewAssignment {
+  reviewId: string;
+  trigger: PolicyReviewTrigger;
+  policyVersion: number;
+}
+
 export interface RunSpec {
   schemaVersion: 1;
   runId: string;
@@ -220,7 +245,12 @@ export interface RunState {
   frontier: readonly FrontierSlot[];
   activeAssignment?: Assignment;
   budgetUsage: BudgetUsage;
+  /** Kept alongside activePolicy for compact status consumers. */
   policyVersion: number;
+  activePolicy: FrontierPolicyVersion;
+  /** Append-only policy snapshots; rollback adds a new version rather than rewriting this history. */
+  policyHistory: readonly FrontierPolicyVersion[];
+  activePolicyReview?: PolicyReviewAssignment;
   lastEventIndex: number;
   latestDecision?: string;
 }
@@ -228,6 +258,8 @@ export interface RunState {
 export type RunEventType =
   | "run-configured"
   | "frontier-policy-recorded"
+  | "policy-review-recorded"
+  | "policy-review-finished"
   | "run-started"
   | "pause-requested"
   | "run-paused"
@@ -241,12 +273,15 @@ export type RunEventType =
   | "experiment-finished"
   | "policy-proposed"
   | "policy-updated"
+  | "policy-rolled-back"
   | "run-completed"
   | "run-failed";
 
 export interface RunEventDataMap {
   "run-configured": { specDigest: string; spec: RunSpec; baseline: BaselineRecord };
-  "frontier-policy-recorded": Record<string, never>;
+  "frontier-policy-recorded": { policy: FrontierPolicyVersion };
+  "policy-review-recorded": { review: PolicyReviewAssignment };
+  "policy-review-finished": { reviewId: string; status: "proposed" | "failed" | "timed-out" | "cancelled"; reason?: string };
   "run-started": Record<string, never>;
   "pause-requested": Record<string, never>;
   "run-paused": Record<string, never>;
@@ -258,8 +293,22 @@ export interface RunEventDataMap {
   "evaluation-recorded": { evaluation: Evaluation };
   "frontier-updated": { slots: readonly FrontierSlot[]; reason: string };
   "experiment-finished": { nodeId: string; outcome: NodeOutcome };
-  "policy-proposed": { version: number; proposal: Readonly<Record<string, number>> };
-  "policy-updated": { version: number; previousVersion: number };
+  /** Accepted proposals are normalized; rejected submissions retain only a bounded canonical audit record. */
+  "policy-proposed": {
+    version: number;
+    reviewId: string;
+    trigger: PolicyReviewTrigger;
+    proposal: unknown;
+    accepted: boolean;
+    reason: string;
+  };
+  "policy-updated": { version: number; previousVersion: number; policy: FrontierPolicyVersion };
+  "policy-rolled-back": {
+    version: number;
+    previousVersion: number;
+    restoredVersion: number;
+    policy: FrontierPolicyVersion;
+  };
   "run-completed": { reason: string };
   "run-failed": { reason: string };
 }

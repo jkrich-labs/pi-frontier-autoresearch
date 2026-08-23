@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   FrontierController,
+  initialPolicyVersion,
   type Assignment,
   type Evaluation,
   type FrontierEvent,
@@ -567,6 +568,42 @@ test("replay rejects fabricated locally valid frontier transitions and decisions
   const falseRoleFinal = falseRole.at(-1);
   if (falseRoleFinal?.type === "evaluation-recorded") falseRoleFinal.decision.role = "LEAN";
   assert.throws(() => frontier.replay(falseRole), /decision does not match derived transition/);
+});
+
+test("replay verifies persisted roles under the policy that derived their transition", () => {
+  const versionOne = initialPolicyVersion(policy);
+  const versionTwo = {
+    version: 2,
+    frontier: { ...policy, diversePrimaryTolerance: 0 },
+    weights: { ...versionOne.weights },
+  };
+  const frontier = controller({ policyVersions: [versionOne, versionTwo] });
+  let history: FrontierEvent[] = [];
+  history = add(frontier, history, node("policy-root", "baseline", ["src/root.ts"], 10), 100);
+  const versionOneAssignment = frontier.nextAssignment(history, { experimentId: "policy-one", policyVersion: 1 });
+  history.push(versionOneAssignment);
+  const near = node("policy-near", versionOneAssignment.assignment, ["src/near.ts"], 20);
+  history.push(frontier.recordEvaluation(history, { node: near, evaluation: evaluation(near.id, 98) }));
+  assert.deepEqual(frontier.replay(history).frontier, [
+    { index: 0, role: "BEST", nodeId: "policy-root" },
+    { index: 1, role: "DIVERSE", nodeId: "policy-near" },
+  ]);
+
+  // Policy version two is active for this pending assignment, but has not yet
+  // derived a transition. Replay must retain and verify version one's slots.
+  history.push(frontier.nextAssignment(history, { experimentId: "policy-two", policyVersion: 2 }));
+  assert.deepEqual(frontier.replay(history).frontier, [
+    { index: 0, role: "BEST", nodeId: "policy-root" },
+    { index: 1, role: "DIVERSE", nodeId: "policy-near" },
+  ]);
+
+  const tampered = structuredClone(history);
+  const transition = tampered.at(-2);
+  assert.equal(transition?.type, "evaluation-recorded");
+  if (transition?.type === "evaluation-recorded") {
+    transition.frontier = [{ index: 0, role: "BEST", nodeId: "policy-root" }];
+  }
+  assert.throws(() => frontier.replay(tampered), /frontier transition does not match derived transition/);
 });
 
 test("failed, unconfirmed, and crashed nodes stay in lineage but never enter the frontier", () => {

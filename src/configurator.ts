@@ -10,6 +10,7 @@ import {
 import { Evaluator } from "./evaluator.ts";
 import { MetricParseError, parseMetricOutput } from "./metrics.ts";
 import { LOCAL_RUN_GLOB } from "./paths.ts";
+import { initialPolicyVersion } from "./policy-tuning.ts";
 import { digestRunSpec, renderRunSpec } from "./run-spec.ts";
 
 export class ConfigurationError extends Error {
@@ -56,6 +57,7 @@ export class RunConfigurator {
     await this.#dryRunCommands(spec, signal);
     const baseline = await this.#calibrate(spec, signal);
     this.#verifyBaselineGuards(spec, baseline);
+    const initialPolicy = initialPolicyVersion(spec.frontierPolicy);
     const state: RunState = {
       spec,
       status: "configured",
@@ -64,6 +66,8 @@ export class RunConfigurator {
       frontier: [],
       budgetUsage: { experiments: 0, wallTimeMs: 0, reportedCostUsd: 0 },
       policyVersion: 1,
+      activePolicy: initialPolicy,
+      policyHistory: [initialPolicy],
       lastEventIndex: 0,
       latestDecision: "Run configured; use /autoresearch start to begin experiments.",
     };

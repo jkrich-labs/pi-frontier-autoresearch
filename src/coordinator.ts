@@ -4,6 +4,8 @@ import type {
   Clock,
   EvaluatorAdapter,
   GitWorkspacePort,
+  PolicyReviewOutcome,
+  PolicyReviewerAdapter,
   ProcessExecutor,
   ProcessGroupIdentity,
   StoreAdapter,
@@ -16,6 +18,8 @@ import type {
   BaselineRecord,
   Evaluation,
   NodeRecord,
+  PolicyReviewAssignment,
+  PolicyReviewTrigger,
   RunEvent,
   RunEventDataMap,
   RunEventType,
@@ -25,6 +29,12 @@ import type {
 import { FrontierController, type FrontierEvent } from "./frontier.ts";
 import { NodeProcessExecutor } from "./process.ts";
 import { RunConfigurator, type ConfiguredRun } from "./configurator.ts";
+import { PolicyReviewer } from "./policy-reviewer.ts";
+import {
+  initialPolicyVersion,
+  restoredPolicyVersion,
+  validatePolicyProposal,
+} from "./policy-tuning.ts";
 
 export interface RunCoordinatorDependencies {
   store: StoreAdapter;
@@ -35,6 +45,8 @@ export interface RunCoordinatorDependencies {
   /** The executor that owns Pi worker process groups. */
   processExecutor?: ProcessExecutor;
   configurator?: Pick<RunConfigurator, "configure">;
+  /** Fresh, submit-only worker used only when policyTuning.enabled is true. */
+  policyReviewer?: PolicyReviewerAdapter;
 }
 
 interface FrontierProjection {
@@ -44,7 +56,10 @@ interface FrontierProjection {
   pendingNode?: NodeRecord;
 }
 
-type LoopAction = "continue" | "seed" | "return";
+type LoopAction = "continue" | "seed" | "review" | "return";
+
+const POLICY_REVIEW_SIGNAL_WINDOW = 3;
+const POLICY_REVIEW_MIN_EXPERIMENTS_BETWEEN_REVIEWS = 3;
 
 interface ActiveWorker {
   assignment: Assignment;
@@ -71,11 +86,22 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Never copy untrusted reviewer diagnostics into the durable event log. */
+function policyReviewFinishedReason(outcome: PolicyReviewOutcome): string {
+  switch (outcome.status) {
+    case "proposed": return "Policy reviewer submitted a structured proposal.";
+    case "failed": return "Policy reviewer failed.";
+    case "timed-out": return "Policy reviewer timed out.";
+    case "cancelled": return "Policy reviewer cancelled.";
+  }
+}
+
 function at(milliseconds: number): string {
   return new Date(milliseconds).toISOString();
 }
 
 function initialState(spec: RunSpec, baseline: BaselineRecord, index: number): RunState {
+  const activePolicy = initialPolicyVersion(spec.frontierPolicy);
   return {
     spec,
     status: "configured",
@@ -84,6 +110,8 @@ function initialState(spec: RunSpec, baseline: BaselineRecord, index: number): R
     frontier: [],
     budgetUsage: { experiments: 0, wallTimeMs: 0, reportedCostUsd: 0 },
     policyVersion: 1,
+    activePolicy,
+    policyHistory: [activePolicy],
     lastEventIndex: index,
     latestDecision: "Run configured; use /autoresearch start to begin experiments.",
   };
@@ -115,6 +143,7 @@ export class RunCoordinator {
   readonly #clock: Clock;
   readonly #process: ProcessExecutor;
   readonly #configurator: Pick<RunConfigurator, "configure">;
+  readonly #policyReviewer: PolicyReviewerAdapter;
   readonly #creator: CandidateCreator;
 
   #state: RunState | undefined;
@@ -127,6 +156,8 @@ export class RunCoordinator {
   #workerPassiveExitWait: Promise<boolean> | undefined;
   /** Concurrent stops may share an active termination, never a passive wait. */
   #workerActiveTermination: Promise<boolean> | undefined;
+  #policyReviewAbort: AbortController | undefined;
+  #policyReviewGroup: ProcessGroupIdentity | undefined;
   #disposedForRecovery = false;
   #mutationTail: Promise<void> = Promise.resolve();
 
@@ -142,6 +173,7 @@ export class RunCoordinator {
       store: this.#store,
       clock: this.#clock,
     });
+    this.#policyReviewer = dependencies.policyReviewer ?? new PolicyReviewer({ processExecutor: this.#process });
     this.#creator = new CandidateCreator(this.#workspace, this.#worker);
   }
 
@@ -189,6 +221,27 @@ export class RunCoordinator {
     });
   }
 
+  /** Restore a prior immutable policy as a new version; history is never rewritten. */
+  async rollbackPolicy(restoredVersion: number): Promise<RunState> {
+    return await this.#exclusive(async () => {
+      await this.#loadUnlocked();
+      const state = this.#requireState();
+      if (state.activeAssignment || state.activePolicyReview) {
+        throw new Error("Policy rollback requires an experiment boundary.");
+      }
+      const source = state.policyHistory.find((policy) => policy.version === restoredVersion);
+      if (!source) throw new Error(`Policy version ${restoredVersion} is not available for rollback.`);
+      const policy = restoredPolicyVersion(source, state.activePolicy.version + 1);
+      await this.#appendUnlocked("policy-rolled-back", {
+        version: policy.version,
+        previousVersion: state.activePolicy.version,
+        restoredVersion,
+        policy,
+      });
+      return this.#statusUnlocked();
+    });
+  }
+
   async stop(reason = "Stopped by user."): Promise<RunState> {
     const request = await this.#exclusive(async () => {
       await this.#loadUnlocked();
@@ -198,7 +251,8 @@ export class RunCoordinator {
       }
       if (state.status !== "stopping") await this.#appendUnlocked("stop-requested", { reason });
       this.#workerAbort?.abort(new Error(reason));
-      return { loop: this.#loop, group: this.#workerGroup, alreadyTerminal: false };
+      this.#policyReviewAbort?.abort(new Error(reason));
+      return { loop: this.#loop, group: this.#workerGroup ?? this.#policyReviewGroup, alreadyTerminal: false };
     });
     if (request.group !== undefined) await this.#terminateOwnedGroup(request.group);
     if (request.loop) await request.loop;
@@ -256,8 +310,14 @@ export class RunCoordinator {
       // This is deliberately after marker ownership is terminated and confirmed. A
       // potentially live worker must never race worktree cleanup or materialisation.
       await this.#workspace.recover();
-      await this.#reconcileActiveAssignmentUnlocked(marker);
-      if (marker && this.#markerBoundariesRecorded(marker.experimentId)) {
+      if (marker?.kind === "policy-review" || (!marker && this.#requireState().activePolicyReview)) {
+        await this.#reconcileActivePolicyReviewUnlocked(marker);
+      } else {
+        await this.#reconcileActiveAssignmentUnlocked(marker);
+      }
+      if (marker && (marker.kind === "policy-review"
+        ? this.#policyReviewBoundaryRecorded(marker.reviewId ?? marker.experimentId)
+        : this.#markerBoundariesRecorded(marker.experimentId))) {
         await this.#store.clearWorkerMarker?.();
       }
       if (["running", "pausing", "stopping"].includes(this.#requireState().status)) this.#launchUnlocked();
@@ -288,7 +348,7 @@ export class RunCoordinator {
       throw new Error(`Cannot start a run that is ${state.status}.`);
     }
     if (!this.#events.some((event) => event.type === "frontier-policy-recorded")) {
-      await this.#appendUnlocked("frontier-policy-recorded", {});
+      await this.#appendUnlocked("frontier-policy-recorded", { policy: this.#requireState().activePolicy });
     }
     await this.#appendUnlocked("run-started", {});
     this.#launchUnlocked();
@@ -330,6 +390,7 @@ export class RunCoordinator {
       primaryMetric: spec.primaryMetric,
       primaryDirection: primary.direction,
       policy: spec.frontierPolicy,
+      policyVersions: this.#requireState().policyHistory,
     });
   }
 
@@ -380,6 +441,10 @@ export class RunCoordinator {
         state.latestDecision = event.data.reason;
         break;
       case "assignment-recorded":
+        if (state.activePolicyReview) throw new Error("Cannot assign a candidate while a policy review is active.");
+        if (event.data.assignment.policyVersion !== state.activePolicy.version) {
+          throw new Error(`Assignment ${event.data.assignment.experimentId} does not use the active policy version.`);
+        }
         state.activeAssignment = event.data.assignment;
         state.latestDecision = `Assigned ${event.data.assignment.experimentId}.`;
         break;
@@ -427,9 +492,84 @@ export class RunCoordinator {
         state.latestDecision = event.data.reason;
         break;
       case "frontier-policy-recorded":
+        if (!isDeepStrictEqual(event.data.policy, state.activePolicy)) {
+          throw new Error("Recorded initial policy does not match the configured frontier policy.");
+        }
+        break;
+      case "policy-review-recorded":
+        if (state.activeAssignment || state.activePolicyReview) {
+          throw new Error("Policy review must begin at an experiment boundary.");
+        }
+        if (event.data.review.policyVersion !== state.activePolicy.version) {
+          throw new Error("Policy review does not use the active policy version.");
+        }
+        state.activePolicyReview = event.data.review;
+        state.latestDecision = `Reviewing policy after ${event.data.review.trigger}.`;
+        break;
+      case "policy-review-finished":
+        if (!state.activePolicyReview || state.activePolicyReview.reviewId !== event.data.reviewId) {
+          throw new Error("Policy review completion does not match an active review.");
+        }
+        state.activePolicyReview = undefined;
+        break;
+      case "policy-proposed": {
+        const finished = this.#events.find((candidate) => candidate.index === event.index - 1);
+        const review = this.#events.find((candidate) =>
+          candidate.type === "policy-review-recorded" && candidate.data.review.reviewId === event.data.reviewId,
+        );
+        if (finished?.type !== "policy-review-finished" || finished.data.status !== "proposed" ||
+          finished.data.reviewId !== event.data.reviewId || review?.type !== "policy-review-recorded" ||
+          review.data.review.trigger !== event.data.trigger || review.data.review.policyVersion !== state.activePolicy.version) {
+          throw new Error("Policy proposal does not match a completed policy review.");
+        }
+        if (event.data.version !== state.activePolicy.version + 1) {
+          throw new Error("Policy proposal version must immediately follow the active version.");
+        }
+        const validation = validatePolicyProposal(state.activePolicy, event.data.proposal, event.data.version);
+        const validDecision = validation.accepted
+          ? event.data.accepted && event.data.reason === "Policy proposal accepted."
+          : !event.data.accepted && event.data.reason === validation.reason;
+        if (!validDecision || !isDeepStrictEqual(event.data.proposal, validation.proposal)) {
+          throw new Error("Policy proposal validation does not match the recorded decision.");
+        }
+        break;
+      }
+      case "policy-updated": {
+        const proposal = this.#events.find((candidate) => candidate.index === event.index - 1);
+        if (proposal?.type !== "policy-proposed" || !proposal.data.accepted) {
+          throw new Error("Policy update requires its immediately preceding accepted proposal.");
+        }
+        if (proposal.data.version !== event.data.version ||
+          event.data.version !== state.activePolicy.version + 1 ||
+          event.data.previousVersion !== state.activePolicy.version ||
+          event.data.policy.version !== event.data.version) {
+          throw new Error("Policy update version must equal its accepted proposal and immediately follow the active policy.");
+        }
+        const validation = validatePolicyProposal(state.activePolicy, proposal.data.proposal, proposal.data.version);
+        if (!validation.accepted || !isDeepStrictEqual(event.data.policy, validation.policy)) {
+          throw new Error("Policy update does not match its accepted bounded proposal.");
+        }
+        state.activePolicy = event.data.policy;
+        state.policyVersion = event.data.policy.version;
+        state.policyHistory = [...state.policyHistory, event.data.policy];
+        state.latestDecision = `Activated policy version ${event.data.policy.version}.`;
+        break;
+      }
+      case "policy-rolled-back": {
+        if (event.data.version !== state.activePolicy.version + 1 || event.data.previousVersion !== state.activePolicy.version) {
+          throw new Error("Policy rollback version is not contiguous.");
+        }
+        const source = state.policyHistory.find((policy) => policy.version === event.data.restoredVersion);
+        if (!source || !isDeepStrictEqual(event.data.policy, restoredPolicyVersion(source, event.data.version))) {
+          throw new Error("Policy rollback does not restore an earlier immutable version.");
+        }
+        state.activePolicy = event.data.policy;
+        state.policyVersion = event.data.policy.version;
+        state.policyHistory = [...state.policyHistory, event.data.policy];
+        state.latestDecision = `Rolled back policy version ${event.data.previousVersion} to ${event.data.restoredVersion} as version ${event.data.version}.`;
+        break;
+      }
       case "run-configured":
-      case "policy-proposed":
-      case "policy-updated":
         break;
     }
     state.lastEventIndex = event.index;
@@ -500,6 +640,10 @@ export class RunCoordinator {
           await this.#seedBaseline();
           continue;
         }
+        if (action === "review") {
+          await this.#reviewPolicy();
+          continue;
+        }
         await this.#continueActive();
       }
     } catch (error) {
@@ -532,6 +676,7 @@ export class RunCoordinator {
         await this.#appendUnlocked("run-completed", { reason: exhausted });
         return "return";
       }
+      if (this.#policyReviewTrigger()) return "review";
       const frontier = this.#controller();
       const projection = this.#frontierProjection(frontier);
       const assignment = frontier.nextAssignment(projection.history).assignment;
@@ -539,6 +684,155 @@ export class RunCoordinator {
       await this.#appendUnlocked("assignment-recorded", { assignment }, assignment.experimentId);
       return "continue";
     });
+  }
+
+  /**
+   * Reviews are opt-in and only occur after three completed candidate boundaries:
+   * either every outcome failed/interrupted (degeneration), or none was
+   * promoted (stall). A review consumes no candidate budget and at least three
+   * further candidates must complete before another review may be launched.
+   */
+  #policyReviewTrigger(): PolicyReviewTrigger | undefined {
+    const state = this.#requireState();
+    if (state.spec.policyTuning?.enabled !== true || state.activePolicyReview) return undefined;
+    const completed = this.#events
+      .filter((event): event is Extract<RunEvent, { type: "experiment-finished" }> => event.type === "experiment-finished")
+      .filter((event) => event.data.nodeId !== "baseline");
+    if (completed.length < POLICY_REVIEW_SIGNAL_WINDOW) return undefined;
+    const lastReview = this.#events.findLast((event) => event.type === "policy-review-recorded");
+    const completedSinceReview = lastReview
+      ? completed.filter((event) => event.index > lastReview.index)
+      : completed;
+    if (completedSinceReview.length < POLICY_REVIEW_MIN_EXPERIMENTS_BETWEEN_REVIEWS) return undefined;
+    const recent = completed.slice(-POLICY_REVIEW_SIGNAL_WINDOW).map((event) => event.data.outcome);
+    if (recent.every((outcome) => ["failed", "interrupted"].includes(outcome))) {
+      return "degeneration-terminal-outcomes";
+    }
+    if (recent.every((outcome) => outcome !== "promoted")) return "stall-no-promotions";
+    return undefined;
+  }
+
+  #recentPolicyOutcomes(): readonly NodeRecord["outcome"][] {
+    return this.#events
+      .filter((event): event is Extract<RunEvent, { type: "experiment-finished" }> => event.type === "experiment-finished")
+      .filter((event) => event.data.nodeId !== "baseline")
+      .slice(-POLICY_REVIEW_SIGNAL_WINDOW)
+      .map((event) => event.data.outcome);
+  }
+
+  async #reviewPolicy(): Promise<void> {
+    const prepared = await this.#exclusive(async () => {
+      const state = this.#requireState();
+      const trigger = this.#policyReviewTrigger();
+      if (state.status !== "running" || state.activeAssignment || !trigger) return undefined;
+      const review: PolicyReviewAssignment = {
+        reviewId: `policy-review-${String(this.#events.filter((event) => event.type === "policy-review-recorded").length + 1).padStart(4, "0")}`,
+        trigger,
+        policyVersion: state.activePolicy.version,
+      };
+      await this.#appendUnlocked("policy-review-recorded", { review });
+      const abort = new AbortController();
+      this.#policyReviewAbort = abort;
+      this.#policyReviewGroup = undefined;
+      return {
+        abort,
+        context: {
+          spec: state.spec,
+          review,
+          trigger,
+          activePolicy: state.activePolicy,
+          recentOutcomes: this.#recentPolicyOutcomes(),
+        },
+      };
+    });
+    if (!prepared) return;
+
+    let clearMarker = false;
+    let marker: WorkerMarker = {
+      experimentId: prepared.context.review.reviewId,
+      kind: "policy-review",
+      reviewId: prepared.context.review.reviewId,
+    };
+    const persistMarker = async (next: WorkerMarker): Promise<void> => {
+      marker = next;
+      await this.#store.writeWorkerMarker?.(marker);
+    };
+    try {
+      await persistMarker(marker);
+      let outcome: PolicyReviewOutcome;
+      try {
+        outcome = await this.#policyReviewer.review(prepared.context, prepared.abort.signal, async (identity) => {
+          const stopRequested = await this.#exclusive(async () => {
+            await persistMarker({ ...marker, process: identity });
+            this.#policyReviewGroup = identity;
+            return this.#requireState().status === "stopping";
+          });
+          if (stopRequested && !await this.#terminateOwnedGroup(identity)) {
+            throw new UnconfirmedWorkerTerminationError(identity.processGroupId);
+          }
+        });
+      } catch (error) {
+        outcome = {
+          status: prepared.abort.signal.aborted ? "cancelled" : "failed",
+          stdout: "",
+          stderr: "Policy reviewer adapter failed.",
+          reason: "Policy reviewer adapter failed.",
+        };
+      }
+      const group = this.#policyReviewGroup;
+      if (group) {
+        if (!await this.#waitForOwnedGroupExit(group)) {
+          throw new UnconfirmedWorkerTerminationError(group.processGroupId);
+        }
+        // Recovery must know that this exact group has already drained before it
+        // reconciles a crash between process exit and policy-result persistence.
+        await persistMarker({ ...marker, process: group, processExited: true });
+      }
+      await this.#exclusive(async () => {
+        if (this.#disposedForRecovery) return;
+        const state = this.#requireState();
+        const stopped = prepared.abort.signal.aborted || state.status === "stopping";
+        const finishedStatus = stopped ? "cancelled" : outcome.status;
+        await this.#appendUnlocked("policy-review-finished", {
+          reviewId: prepared.context.review.reviewId,
+          status: finishedStatus,
+          reason: stopped ? "Policy review interrupted by stop request." : policyReviewFinishedReason(outcome),
+        });
+        if (!stopped && outcome.status === "proposed") {
+          const version = state.activePolicy.version + 1;
+          const validation = validatePolicyProposal(state.activePolicy, outcome.proposal, version);
+          const reason = validation.accepted ? "Policy proposal accepted." : validation.reason;
+          await this.#appendUnlocked("policy-proposed", {
+            version,
+            reviewId: prepared.context.review.reviewId,
+            trigger: prepared.context.trigger,
+            proposal: validation.proposal,
+            accepted: validation.accepted,
+            reason,
+          });
+          if (validation.accepted) {
+            await this.#appendUnlocked("policy-updated", {
+              version: validation.policy.version,
+              previousVersion: state.activePolicy.version,
+              policy: validation.policy,
+            });
+          }
+        }
+      });
+    } finally {
+      await this.#exclusive(async () => {
+        if (this.#policyReviewAbort === prepared.abort) {
+          clearMarker = !this.#disposedForRecovery && this.#events.some((event) =>
+            event.type === "policy-review-finished" && event.data.reviewId === prepared.context.review.reviewId,
+          );
+          this.#policyReviewAbort = undefined;
+          this.#policyReviewGroup = undefined;
+          this.#workerPassiveExitWait = undefined;
+          this.#workerActiveTermination = undefined;
+        }
+      });
+      if (clearMarker) await this.#store.clearWorkerMarker?.();
+    }
   }
 
   #budgetExhausted(): string | undefined {
@@ -808,6 +1102,10 @@ export class RunCoordinator {
       this.#requireState().nodes[experimentId] !== undefined;
   }
 
+  #policyReviewBoundaryRecorded(reviewId: string): boolean {
+    return this.#events.some((event) => event.type === "policy-review-finished" && event.data.reviewId === reviewId);
+  }
+
   async #evaluateNewCandidate(assignment: Assignment, candidate: NodeRecord): Promise<void> {
     // Candidate creation has committed and persisted this node already. Recording the
     // boundary before evaluation means a crash resumes this candidate exactly once.
@@ -961,6 +1259,21 @@ export class RunCoordinator {
     }
     await this.#store.writeWorkerMarker?.({ ...marker, processExited: true });
     return true;
+  }
+
+  async #reconcileActivePolicyReviewUnlocked(marker: WorkerMarker | undefined): Promise<void> {
+    const review = this.#requireState().activePolicyReview;
+    if (!review) return;
+    if (marker && review.reviewId !== (marker.reviewId ?? marker.experimentId)) {
+      throw new Error("Recovered policy-review marker does not match the active policy review.");
+    }
+    if (!this.#policyReviewBoundaryRecorded(review.reviewId)) {
+      await this.#appendUnlocked("policy-review-finished", {
+        reviewId: review.reviewId,
+        status: "cancelled",
+        reason: "Policy review interrupted during recovery.",
+      });
+    }
   }
 
   async #reconcileActiveAssignmentUnlocked(marker: WorkerMarker | undefined): Promise<void> {

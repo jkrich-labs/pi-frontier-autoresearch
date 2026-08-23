@@ -4,21 +4,17 @@ import type {
   Assignment,
   Evaluation,
   FrontierPolicy,
+  FrontierPolicyVersion,
   FrontierRole,
+  FrontierSelectionWeights,
   FrontierSlot,
   MetricDirection,
   NodeRecord,
   PromotionGate,
 } from "./contracts.ts";
+import { DEFAULT_FRONTIER_SELECTION_WEIGHTS } from "./policy-tuning.ts";
 
-export interface FrontierSelectionWeights {
-  productivity: number;
-  exploration: number;
-  novelty: number;
-  coverage: number;
-  recency: number;
-  pairRepetitionPenalty: number;
-}
+export type { FrontierSelectionWeights } from "./contracts.ts";
 
 export interface FrontierControllerConfig {
   primaryMetric: string;
@@ -27,10 +23,12 @@ export interface FrontierControllerConfig {
   costMetric?: string;
   costDirection?: MetricDirection;
   weights?: Partial<FrontierSelectionWeights>;
+  /** All accepted immutable versions, with version one first. */
+  policyVersions?: readonly FrontierPolicyVersion[];
 }
 
 export interface ResolvedFrontierPolicy {
-  version: 1;
+  version: number;
   primaryMetric: string;
   primaryDirection: MetricDirection;
   costMetric: string | null;
@@ -114,14 +112,6 @@ export interface NextAssignmentInput {
   policyVersion?: number;
 }
 
-const DEFAULT_WEIGHTS: FrontierSelectionWeights = {
-  productivity: 1,
-  exploration: 0.7,
-  novelty: 0.35,
-  coverage: 0.25,
-  recency: 0.2,
-  pairRepetitionPenalty: 0.8,
-};
 
 function assignmentParentIds(assignment: Assignment): string[] {
   return [assignment.primaryParentId, assignment.donorParentId]
@@ -225,51 +215,77 @@ function assignmentMatchesNode(assignment: Assignment, node: NodeRecord): boolea
 export class FrontierController {
   readonly config: FrontierControllerConfig;
   readonly weights: FrontierSelectionWeights;
+  /** The newest accepted policy drives the next assignment. */
   readonly resolvedPolicy: ResolvedFrontierPolicy;
+  readonly #initialPolicy: ResolvedFrontierPolicy;
+  readonly #policies: ReadonlyMap<number, ResolvedFrontierPolicy>;
 
   constructor(config: FrontierControllerConfig) {
     if (!config.primaryMetric.trim()) throw new Error("primaryMetric must be non-empty");
     if (config.primaryDirection !== "higher" && config.primaryDirection !== "lower") {
       throw new Error("primaryDirection must be higher or lower");
     }
-    if (config.policy.size !== 4) throw new Error("frontier size must be four");
-    for (const [name, value] of Object.entries({
-      leanPrimaryTolerance: config.policy.leanPrimaryTolerance,
-      diversePrimaryTolerance: config.policy.diversePrimaryTolerance,
-      diverseNoveltyThreshold: config.policy.diverseNoveltyThreshold,
-    })) {
-      if (!Number.isFinite(value) || value < 0 || value > 1) {
-        throw new Error(`${name} must be between zero and one`);
-      }
-    }
-    if (!Number.isInteger(config.policy.crossoverCadence) || config.policy.crossoverCadence < 1) {
-      throw new Error("crossoverCadence must be a positive integer");
-    }
     if (config.costDirection !== undefined && config.costDirection !== "higher" && config.costDirection !== "lower") {
       throw new Error("costDirection must be higher or lower");
     }
 
-    const frontier = Object.freeze({ ...config.policy });
-    this.weights = Object.freeze({ ...DEFAULT_WEIGHTS, ...config.weights });
-    for (const [name, value] of Object.entries(this.weights)) {
-      if (!Number.isFinite(value) || value < 0) throw new Error(`${name} weight must be finite and non-negative`);
+    const configuredInitial: FrontierPolicyVersion = {
+      version: 1,
+      frontier: { ...config.policy },
+      weights: { ...DEFAULT_FRONTIER_SELECTION_WEIGHTS, ...config.weights },
+    };
+    const versions = config.policyVersions === undefined ? [configuredInitial] : [...config.policyVersions];
+    if (versions.length === 0 || versions[0]?.version !== 1) {
+      throw new Error("policy history must begin at version one");
     }
+    if (!isDeepStrictEqual(versions[0].frontier, configuredInitial.frontier)) {
+      throw new Error("policy version one must match the configured frontier policy");
+    }
+    const resolved = new Map<number, ResolvedFrontierPolicy>();
+    let previousVersion = 0;
+    for (const version of versions) {
+      if (!Number.isInteger(version.version) || version.version !== previousVersion + 1) {
+        throw new Error("policy versions must increase contiguously");
+      }
+      previousVersion = version.version;
+      if (version.frontier.size !== 4) throw new Error("frontier size must be four");
+      for (const [name, value] of Object.entries({
+        leanPrimaryTolerance: version.frontier.leanPrimaryTolerance,
+        diversePrimaryTolerance: version.frontier.diversePrimaryTolerance,
+        diverseNoveltyThreshold: version.frontier.diverseNoveltyThreshold,
+      })) {
+        if (!Number.isFinite(value) || value < 0 || value > 1) {
+          throw new Error(`${name} must be between zero and one`);
+        }
+      }
+      if (!Number.isInteger(version.frontier.crossoverCadence) || version.frontier.crossoverCadence < 1) {
+        throw new Error("crossoverCadence must be a positive integer");
+      }
+      for (const [name, value] of Object.entries(version.weights)) {
+        if (!Number.isFinite(value) || value < 0) throw new Error(`${name} weight must be finite and non-negative`);
+      }
+      resolved.set(version.version, Object.freeze({
+        version: version.version,
+        primaryMetric: config.primaryMetric,
+        primaryDirection: config.primaryDirection,
+        costMetric: config.costMetric ?? null,
+        costDirection: config.costDirection ?? "lower",
+        frontier: Object.freeze({ ...version.frontier }),
+        weights: Object.freeze({ ...version.weights }),
+      }));
+    }
+    this.#policies = resolved;
+    this.#initialPolicy = resolved.get(1)!;
+    this.resolvedPolicy = resolved.get(previousVersion)!;
+    this.weights = this.resolvedPolicy.weights;
     this.config = Object.freeze({
       primaryMetric: config.primaryMetric,
       primaryDirection: config.primaryDirection,
-      policy: frontier,
+      policy: this.resolvedPolicy.frontier,
       costMetric: config.costMetric,
       costDirection: config.costDirection ?? "lower",
       weights: this.weights,
-    });
-    this.resolvedPolicy = Object.freeze({
-      version: 1,
-      primaryMetric: config.primaryMetric,
-      primaryDirection: config.primaryDirection,
-      costMetric: config.costMetric ?? null,
-      costDirection: config.costDirection ?? "lower",
-      frontier,
-      weights: this.weights,
+      policyVersions: versions.map((version) => structuredClone(version)),
     });
   }
 
@@ -277,8 +293,14 @@ export class FrontierController {
     return {
       index: 0,
       type: "policy-recorded",
-      policy: structuredClone(this.resolvedPolicy),
+      policy: structuredClone(this.#initialPolicy),
     };
+  }
+
+  #policyFor(version: number): ResolvedFrontierPolicy {
+    const policy = this.#policies.get(version);
+    if (!policy) throw new Error(`policy version ${version} is an inactive policy version`);
+    return policy;
   }
 
   replay(history: readonly FrontierEvent[]): FrontierSnapshot {
@@ -290,6 +312,9 @@ export class FrontierController {
     let previousIndex = -1;
     let pendingAssignment: Assignment | undefined;
     let activePolicy: ResolvedFrontierPolicy | undefined;
+    // Roles persist under the policy that derived their transition. An assignment
+    // can activate a newer policy before it has produced a new frontier event.
+    let frontierPolicy: ResolvedFrontierPolicy | undefined;
 
     for (const event of history) {
       if (!Number.isInteger(event.index) || event.index !== previousIndex + 1) {
@@ -299,10 +324,11 @@ export class FrontierController {
 
       if (event.type === "policy-recorded") {
         if (validatedHistory.length !== 0 || activePolicy) throw new Error("fixed policy must be the first event");
-        if (!isDeepStrictEqual(event.policy, this.resolvedPolicy)) {
+        if (!isDeepStrictEqual(event.policy, this.#initialPolicy)) {
           throw new Error("recorded policy does not match the active controller policy");
         }
         activePolicy = event.policy;
+        frontierPolicy = event.policy;
         validatedHistory.push(event);
         continue;
       }
@@ -311,18 +337,17 @@ export class FrontierController {
       if (event.type === "assignment-recorded") {
         if (pendingAssignment) throw new Error(`assignment ${pendingAssignment.experimentId} has not been evaluated`);
         assertAssignmentParentage(event.assignment);
-        if (event.assignment.policyVersion !== activePolicy.version) {
-          throw new Error(`assignment ${event.assignment.experimentId} uses an inactive policy version`);
-        }
-        const snapshot = this.snapshot(nodes, evaluations, frontier, statistics, undefined, previousIndex - 1, activePolicy);
+        const assignmentPolicy = this.#policyFor(event.assignment.policyVersion);
+        const snapshot = this.snapshot(nodes, evaluations, frontier, statistics, undefined, previousIndex - 1, assignmentPolicy);
         const expected = this.planAssignment(snapshot, validatedHistory, {
           experimentId: event.assignment.experimentId,
           hypothesis: event.assignment.hypothesis,
           policyVersion: event.assignment.policyVersion,
-        });
+        }, assignmentPolicy);
         if (!isDeepStrictEqual(event, expected)) {
           throw new Error(`assignment ${event.assignment.experimentId} does not match nextAssignment`);
         }
+        activePolicy = assignmentPolicy;
         pendingAssignment = event.assignment;
         for (const parentId of assignmentParentIds(event.assignment)) {
           const parentStatistics = statistics[parentId] ??= { attempts: 0, promotions: 0 };
@@ -372,6 +397,7 @@ export class FrontierController {
       statistics[event.node.id] ??= { attempts: 0, promotions: 0 };
       if (event.evaluation) evaluations[event.node.id] = event.evaluation;
       frontier = derived.frontier;
+      frontierPolicy = activePolicy;
       if (derived.decision.promoted && pendingAssignment) {
         for (const parentId of assignmentParentIds(pendingAssignment)) {
           const parentStatistics = statistics[parentId] ??= { attempts: 0, promotions: 0 };
@@ -384,7 +410,7 @@ export class FrontierController {
 
     if (history.length > 0 && !activePolicy) throw new Error("frontier history has no fixed policy event");
     const finalNodes = this.nodesWithStatistics(nodes, statistics);
-    this.assertDerivedFrontier(frontier, finalNodes, evaluations);
+    this.assertDerivedFrontier(frontier, finalNodes, evaluations, frontierPolicy);
     return {
       policy: activePolicy,
       nodes: finalNodes,
@@ -466,7 +492,8 @@ export class FrontierController {
   ): FrontierAssignmentRecordedEvent {
     const snapshot = this.replay(history);
     if (!snapshot.policy) throw new Error("fixed policy must be recorded before frontier events");
-    return this.planAssignment(snapshot, history, input);
+    const policy = input.policyVersion === undefined ? this.resolvedPolicy : this.#policyFor(input.policyVersion);
+    return this.planAssignment(snapshot, history, input, policy);
   }
 
   private provisionallyConfirm(evaluation: Evaluation, nodeId: string): Evaluation {
@@ -528,7 +555,7 @@ export class FrontierController {
     if (eligible) candidates.push(candidate);
     const evaluations: Record<string, Evaluation> = { ...snapshot.evaluations };
     if (evaluation) evaluations[submittedNode.id] = evaluation;
-    const nextFrontier = this.recalculateRoles(candidates, evaluations);
+    const nextFrontier = this.recalculateRoles(candidates, evaluations, snapshot.policy!);
     const promotedSlot = nextFrontier.find((slot) => slot.nodeId === submittedNode.id);
     const outcome: NodeRecord["outcome"] = result === "interrupted"
       ? "interrupted"
@@ -542,7 +569,7 @@ export class FrontierController {
     const recordedNode: NodeRecord = {
       ...submittedNode,
       outcome,
-      policyVersion: 1,
+      policyVersion: snapshot.policy!.version,
       createdEventIndex: index,
       metricSamples: evaluation?.samples ?? submittedNode.metricSamples,
       guardResults: evaluation?.guards ?? submittedNode.guardResults,
@@ -583,18 +610,19 @@ export class FrontierController {
     snapshot: FrontierSnapshot,
     history: readonly FrontierEvent[],
     input: NextAssignmentInput,
+    policy: ResolvedFrontierPolicy = this.resolvedPolicy,
   ): FrontierAssignmentRecordedEvent {
     if (snapshot.frontier.length === 0) throw new Error("cannot select a parent from an empty frontier");
     if (snapshot.activeAssignment) {
       throw new Error(`assignment ${snapshot.activeAssignment.experimentId} has not been evaluated`);
     }
-    if (input.policyVersion !== undefined && input.policyVersion !== this.resolvedPolicy.version) {
+    if (input.policyVersion !== undefined && input.policyVersion !== policy.version) {
       throw new Error(`policy version ${input.policyVersion} is not active`);
     }
     const assignmentEvents = history.filter(
       (event): event is FrontierAssignmentRecordedEvent => event.type === "assignment-recorded",
     );
-    const scores = this.selectionScores(snapshot);
+    const scores = this.selectionScores(snapshot, policy);
     const scoreById = new Map(scores.map((score) => [score.nodeId, score]));
     const lastAssignment = assignmentEvents.at(-1)?.assignment;
     const latestCrossoverOffset = assignmentEvents.findLastIndex(
@@ -606,7 +634,7 @@ export class FrontierController {
     const freshBest = this.freshBest(history, snapshot.frontier[0]!.nodeId);
     const crossoverDue =
       snapshot.frontier.length > 1 &&
-      assignmentsSinceCrossover >= this.config.policy.crossoverCadence - 1;
+      assignmentsSinceCrossover >= policy.frontier.crossoverCadence - 1;
     const operator = snapshot.frontier.length > 1 && (freshBest !== undefined || crossoverDue)
       ? "crossover"
       : "mutation";
@@ -615,7 +643,7 @@ export class FrontierController {
     let donorParentId: string | undefined;
     let reason: string;
     if (operator === "crossover") {
-      const rankedPairs = this.rankPairs(snapshot, scoreById, assignmentEvents, lastAssignment);
+      const rankedPairs = this.rankPairs(snapshot, scoreById, assignmentEvents, lastAssignment, policy);
       const selected = freshBest
         ? rankedPairs.find((pair) => pair.primary === freshBest)
         : rankedPairs[0];
@@ -646,7 +674,7 @@ export class FrontierController {
       primaryParentId,
       ...(donorParentId ? { donorParentId } : {}),
       hypothesis,
-      policyVersion: this.resolvedPolicy.version,
+      policyVersion: policy.version,
     };
     return {
       index: snapshot.lastEventIndex + 1,
@@ -657,7 +685,7 @@ export class FrontierController {
     };
   }
 
-  private selectionScores(snapshot: FrontierSnapshot): FrontierSelectionScore[] {
+  private selectionScores(snapshot: FrontierSnapshot, policy: ResolvedFrontierPolicy): FrontierSelectionScore[] {
     const nodes = snapshot.frontier.map((slot) => snapshot.nodes[slot.nodeId]!);
     const totalAttempts = Object.values(snapshot.statistics).reduce((sum, statistics) => sum + statistics.attempts, 0);
     const exploredDirections = new Map(nodes.map((node) => [node.id, new Set<string>()]));
@@ -685,11 +713,11 @@ export class FrontierController {
               Math.max(1, snapshot.lastEventIndex + 1),
           );
         const total =
-          this.weights.productivity * productivity +
-          this.weights.exploration * exploration +
-          this.weights.novelty * novelty +
-          this.weights.coverage * coverage +
-          this.weights.recency * recency;
+          policy.weights.productivity * productivity +
+          policy.weights.exploration * exploration +
+          policy.weights.novelty * novelty +
+          policy.weights.coverage * coverage +
+          policy.weights.recency * recency;
         return { nodeId: node.id, productivity, exploration, novelty, coverage, recency, total };
       })
       .sort((left, right) => right.total - left.total || left.nodeId.localeCompare(right.nodeId));
@@ -700,6 +728,7 @@ export class FrontierController {
     scoreById: ReadonlyMap<string, FrontierSelectionScore>,
     assignments: readonly FrontierAssignmentRecordedEvent[],
     previous: Assignment | undefined,
+    policy: ResolvedFrontierPolicy,
   ): Array<{ primary: string; donor: string; total: number }> {
     const pairCounts = new Map<string, number>();
     const participationCounts = new Map<string, number>();
@@ -719,14 +748,14 @@ export class FrontierController {
         const donor = snapshot.nodes[donorSlot.nodeId]!;
         const key = [primary.id, donor.id].sort().join("\u0000");
         const participationPenalty =
-          ((participationCounts.get(primary.id) ?? 0) + (participationCounts.get(donor.id) ?? 0)) * this.weights.recency;
+          ((participationCounts.get(primary.id) ?? 0) + (participationCounts.get(donor.id) ?? 0)) * policy.weights.recency;
         const recentRolePenalty =
-          (Number(previousParticipants.has(primary.id)) + Number(previousParticipants.has(donor.id))) * this.weights.recency;
+          (Number(previousParticipants.has(primary.id)) + Number(previousParticipants.has(donor.id))) * policy.weights.recency;
         const total =
           scoreById.get(primary.id)!.total +
           scoreById.get(donor.id)!.total * 0.5 +
-          fileNovelty(primary, donor) * this.weights.novelty -
-          (pairCounts.get(key) ?? 0) * this.weights.pairRepetitionPenalty -
+          fileNovelty(primary, donor) * policy.weights.novelty -
+          (pairCounts.get(key) ?? 0) * policy.weights.pairRepetitionPenalty -
           participationPenalty -
           recentRolePenalty;
         pairs.push({ primary: primary.id, donor: donor.id, total });
@@ -762,6 +791,7 @@ export class FrontierController {
   private recalculateRoles(
     candidates: readonly NodeRecord[],
     evaluations: Readonly<Record<string, Evaluation>>,
+    policy: ResolvedFrontierPolicy,
   ): FrontierSlot[] {
     if (candidates.length === 0) return [];
     const scored = candidates
@@ -785,7 +815,7 @@ export class FrontierController {
     const lean = scored
       .filter(({ node, primary }) =>
         node.id !== best.node.id &&
-        withinTolerance(primary, best.primary, this.config.primaryDirection, this.config.policy.leanPrimaryTolerance),
+        withinTolerance(primary, best.primary, this.config.primaryDirection, policy.frontier.leanPrimaryTolerance),
       )
       .map((entry) => ({ ...entry, cost: this.cost(entry.node, evaluations[entry.node.id]) }))
       .filter((entry) => entry.cost !== undefined && this.improvesCost(entry.cost, this.cost(best.node, evaluations[best.node.id])))
@@ -801,14 +831,14 @@ export class FrontierController {
       roles.push("LEAN");
     }
 
-    while (nodeIds.length < this.config.policy.size) {
+    while (nodeIds.length < policy.frontier.size) {
       const diverse = scored
         .filter(({ node, primary }) =>
           !nodeIds.includes(node.id) &&
-          withinTolerance(primary, best.primary, this.config.primaryDirection, this.config.policy.diversePrimaryTolerance),
+          withinTolerance(primary, best.primary, this.config.primaryDirection, policy.frontier.diversePrimaryTolerance),
         )
         .map((entry) => ({ ...entry, novelty: minimumNovelty(entry.node, selected) }))
-        .filter((entry) => entry.novelty >= this.config.policy.diverseNoveltyThreshold)
+        .filter((entry) => entry.novelty >= policy.frontier.diverseNoveltyThreshold)
         .sort((left, right) =>
           right.novelty - left.novelty ||
           compareMetric(left.primary, right.primary, this.config.primaryDirection) ||
@@ -841,8 +871,9 @@ export class FrontierController {
     frontier: readonly FrontierSlot[],
     nodes: Readonly<Record<string, NodeRecord>>,
     evaluations: Readonly<Record<string, Evaluation>>,
+    policy: ResolvedFrontierPolicy | undefined,
   ): void {
-    if (frontier.length > this.config.policy.size) throw new Error("frontier cannot contain more than four nodes");
+    if (frontier.length > 4) throw new Error("frontier cannot contain more than four nodes");
     if (new Set(frontier.map((slot) => slot.nodeId)).size !== frontier.length) {
       throw new Error("a node cannot occupy multiple frontier slots");
     }
@@ -858,8 +889,15 @@ export class FrontierController {
       }
       return node;
     });
-    if (!isDeepStrictEqual(frontier, this.recalculateRoles(candidates, evaluations))) {
-      throw new Error("frontier roles do not match the fixed policy");
+    if (!policy) {
+      if (frontier.length !== 0) throw new Error("frontier roles have no policy version");
+      return;
+    }
+    // Recheck persisted slots and roles under the exact immutable policy that
+    // derived the latest frontier transition. A newer pending assignment must not
+    // rewrite old roles, but it also must never disable equality verification.
+    if (!isDeepStrictEqual(frontier, this.recalculateRoles(candidates, evaluations, policy))) {
+      throw new Error("frontier roles do not match the policy active at the transition");
     }
   }
 }

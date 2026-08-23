@@ -78,6 +78,62 @@ function assertTimeout(timeoutMs: number): void {
   }
 }
 
+export interface BoundedOutput {
+  text: string;
+  truncated: boolean;
+}
+
+interface BoundedOutputOptions {
+  alreadyTruncated?: boolean;
+  originalBytes?: number;
+}
+
+function utf8Prefix(bytes: Buffer, maximum: number): string {
+  let end = 0;
+  while (end < bytes.length) {
+    const first = bytes[end]!;
+    const length = first <= 0x7f ? 1 : first <= 0xdf ? 2 : first <= 0xef ? 3 : 4;
+    if (end + length > maximum) break;
+    end += length;
+  }
+  return bytes.subarray(0, end).toString("utf8");
+}
+
+function utf8Tail(bytes: Buffer, maximum: number): string {
+  if (maximum <= 0) return "";
+  if (bytes.length <= maximum) return bytes.toString("utf8");
+  let start = bytes.length - maximum;
+  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++;
+  return bytes.subarray(start).toString("utf8");
+}
+
+/** Keep UTF-8 output bounded, including the canonical truncation header. */
+export function boundedOutput(value: string, maximum: number, options: BoundedOutputOptions = {}): BoundedOutput {
+  if (!Number.isInteger(maximum) || maximum <= 0) throw new Error("maxOutputBytes must be a positive integer");
+  const bytes = Buffer.from(value, "utf8");
+  const truncated = options.alreadyTruncated === true || bytes.length > maximum;
+  if (!truncated) return { text: value, truncated: false };
+
+  const originalBytes = Math.max(options.originalBytes ?? bytes.length, bytes.length);
+  const header = `[Output truncated: kept the last ${maximum} of ${originalBytes} bytes.]\n`;
+  const headerBytes = Buffer.byteLength(header, "utf8");
+  if (headerBytes >= maximum) {
+    return { text: utf8Prefix(Buffer.from(header, "utf8"), maximum), truncated: true };
+  }
+  return {
+    text: header + utf8Tail(bytes, maximum - headerBytes),
+    truncated: true,
+  };
+}
+
+function appendBoundedOutput(current: string, chunk: string, maximum: number | undefined): BoundedOutput {
+  if (maximum === undefined) return { text: current + chunk, truncated: false };
+  if (!Number.isInteger(maximum) || maximum <= 0) throw new Error("maxOutputBytes must be a positive integer");
+  const combined = Buffer.concat([Buffer.from(current, "utf8"), Buffer.from(chunk, "utf8")]);
+  if (combined.length <= maximum) return { text: combined.toString("utf8"), truncated: false };
+  return { text: utf8Tail(combined, maximum), truncated: true };
+}
+
 function processGroupGone(processGroupId: number): boolean {
   try {
     process.kill(-processGroupId, 0);
@@ -110,6 +166,9 @@ export class NodeProcessExecutor implements ProcessExecutor {
   }
 
   async run(request: ProcessRequest, signal?: AbortSignal): Promise<ProcessResult> {
+    if (request.maxOutputBytes !== undefined && (!Number.isInteger(request.maxOutputBytes) || request.maxOutputBytes <= 0)) {
+      throw new Error("maxOutputBytes must be a positive integer");
+    }
     const startedAt = this.#clock.now();
     return await new Promise<ProcessResult>((resolve, reject) => {
       const darwinToken = process.platform === "darwin" ? randomUUID() : undefined;
@@ -125,6 +184,10 @@ export class NodeProcessExecutor implements ProcessExecutor {
       });
       let stdout = "";
       let stderr = "";
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
       let timedOut = false;
       let cancelled = false;
       let settled = false;
@@ -165,8 +228,18 @@ export class NodeProcessExecutor implements ProcessExecutor {
 
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => (stdout += chunk));
-      child.stderr.on("data", (chunk: string) => (stderr += chunk));
+      child.stdout.on("data", (chunk: string) => {
+        stdoutBytes += Buffer.byteLength(chunk, "utf8");
+        const bounded = appendBoundedOutput(stdout, chunk, request.maxOutputBytes);
+        stdout = bounded.text;
+        stdoutTruncated ||= bounded.truncated;
+      });
+      child.stderr.on("data", (chunk: string) => {
+        stderrBytes += Buffer.byteLength(chunk, "utf8");
+        const bounded = appendBoundedOutput(stderr, chunk, request.maxOutputBytes);
+        stderr = bounded.text;
+        stderrTruncated ||= bounded.truncated;
+      });
 
       const terminate = (): void => {
         if (child.pid === undefined) return;
@@ -215,14 +288,27 @@ export class NodeProcessExecutor implements ProcessExecutor {
         if (timeout) clearTimeout(timeout);
         if (forceKill) clearTimeout(forceKill);
         signal?.removeEventListener("abort", abort);
+        const boundedStdout = request.maxOutputBytes === undefined
+          ? { text: stdout, truncated: false }
+          : boundedOutput(stdout, request.maxOutputBytes, {
+            alreadyTruncated: stdoutTruncated,
+            originalBytes: stdoutBytes,
+          });
+        const boundedStderr = request.maxOutputBytes === undefined
+          ? { text: stderr, truncated: false }
+          : boundedOutput(stderr, request.maxOutputBytes, {
+            alreadyTruncated: stderrTruncated,
+            originalBytes: stderrBytes,
+          });
         void groupNotification.then(
           () => resolve({
             exitCode,
-            stdout,
-            stderr,
+            stdout: boundedStdout.text,
+            stderr: boundedStderr.text,
             durationMs: this.#clock.now() - startedAt,
             timedOut,
             cancelled,
+            ...(boundedStdout.truncated || boundedStderr.truncated ? { outputTruncated: true } : {}),
           }),
           (error) => reject(error),
         );

@@ -10,15 +10,18 @@ import {
   CandidateCreator,
   GitWorkspaceAdapter,
   PiWorkerAdapter,
+  PolicyReviewer,
   WorkerConfinement,
   createWorkerGuardConfig,
   parseCandidateSubmission,
+  initialPolicyVersion,
   type Assignment,
   type NodeRecord,
   type ProcessGroupIdentity,
   type RunSpec,
 } from "../src/index.ts";
 import workerGuard from "../extensions/pi-frontier-autoresearch/worker-guard.ts";
+import policyReviewGuard from "../extensions/pi-frontier-autoresearch/policy-review-guard.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -617,4 +620,138 @@ test("structured candidate submission validation rejects missing or empty fields
     expectedEffect: "Lower cost",
     reflection: "Keep exploring",
   }), undefined);
+});
+
+test("policy review launches a fresh submit-only Pi process", async (t) => {
+  const repository = await makeRepository();
+  const fixtureDirectory = await mkdtemp(join(tmpdir(), "frontier-policy-review-pi-"));
+  t.after(() => Promise.all([
+    rm(repository.root, { recursive: true, force: true }),
+    rm(fixtureDirectory, { recursive: true, force: true }),
+  ]));
+  const fixture = join(fixtureDirectory, "pi.mjs");
+  const invocation = join(fixtureDirectory, "invocation.json");
+  await writeFile(fixture, `#!/usr/bin/env node
+import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(invocation)}, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd() }));
+console.log(JSON.stringify({ type: "tool_result_end", message: { toolName: "policy_review_submit", details: {
+  rationale: "Increase novelty after a bounded stall.", changes: { noveltyWeight: 0.5 }
+} } }));
+`);
+  await chmod(fixture, 0o755);
+
+  const reviewer = new PolicyReviewer({ executable: fixture, timeoutMs: 2_000 });
+  const outcome = await reviewer.review({
+    spec: runSpec(repository.root),
+    review: { reviewId: "policy-review-0001", trigger: "stall-no-promotions", policyVersion: 1 },
+    trigger: "stall-no-promotions",
+    activePolicy: initialPolicyVersion(runSpec(repository.root).frontierPolicy),
+    recentOutcomes: ["rejected", "rejected", "rejected"],
+  });
+
+  assert.equal(outcome.status, "proposed");
+  assert.deepEqual(outcome.proposal, {
+    rationale: "Increase novelty after a bounded stall.",
+    changes: { noveltyWeight: 0.5 },
+  });
+  const recorded = JSON.parse(await readFile(invocation, "utf8")) as { args: string[]; cwd: string };
+  assert.equal(recorded.cwd, repository.root);
+  for (const flag of [
+    "-p",
+    "--no-session",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-context-files",
+    "--no-approve",
+    "--no-builtin-tools",
+  ]) {
+    assert.ok(recorded.args.includes(flag), `missing policy-review isolation flag ${flag}`);
+  }
+  assert.equal(recorded.args.filter((arg) => arg === "--extension").length, 1);
+  assert.equal(recorded.args.includes("--skill"), false);
+  assert.equal(recorded.args[recorded.args.indexOf("--tools") + 1], "policy_review_submit");
+  assert.equal(recorded.args.some((arg) => arg.includes("bash")), false);
+});
+
+test("policy reviewer bounds process output, proposal bytes, and rationale before returning a submission", async () => {
+  const context = {
+    spec: runSpec(process.cwd()),
+    review: { reviewId: "policy-review-bounds", trigger: "stall-no-promotions" as const, policyVersion: 1 },
+    trigger: "stall-no-promotions" as const,
+    activePolicy: initialPolicyVersion(runSpec(process.cwd()).frontierPolicy),
+    recentOutcomes: ["rejected", "rejected", "rejected"] as const,
+  };
+  const output = (proposal: unknown) => JSON.stringify({
+    type: "tool_result_end",
+    message: { toolName: "policy_review_submit", details: proposal },
+  });
+  const outcomes = [
+    { options: { maxOutputBytes: 128 }, proposal: { rationale: "x".repeat(512), changes: { noveltyWeight: 0.5 } }, reason: /output exceeds/i },
+    { options: { maxOutputBytes: 4_096, maxProposalBytes: 128 }, proposal: { rationale: "x".repeat(512), changes: { noveltyWeight: 0.5 } }, reason: /proposal exceeds/i },
+    { options: { maxOutputBytes: 4_096, maxProposalBytes: 2_048, maxRationaleBytes: 64 }, proposal: { rationale: "x".repeat(512), changes: { noveltyWeight: 0.5 } }, reason: /rationale exceeds/i },
+  ];
+  for (const multibyte of [false, true]) {
+    for (const { options, proposal, reason } of outcomes) {
+      const emittedOutput = multibyte ? `${output(proposal)}\n${"💩".repeat(512)}` : output(proposal);
+      let requestedOutputBytes: number | undefined;
+      const reviewer = new PolicyReviewer({
+        ...options,
+        processExecutor: {
+          async run(request) {
+            requestedOutputBytes = request.maxOutputBytes;
+            return {
+              exitCode: 0,
+              stdout: emittedOutput,
+              stderr: "",
+              durationMs: 1,
+              timedOut: false,
+              cancelled: false,
+            };
+          },
+          async isProcessGroupIdentityCurrent() { return false; },
+          async terminateOwnedProcessGroupAndWait() { return true; },
+          async terminateRecoveredProcessGroupAndWait() { return true; },
+          async waitForProcessGroupExit() { return true; },
+        },
+      });
+      const result = await reviewer.review(context);
+      assert.equal(result.status, "proposed");
+      assert.equal((result.proposal as { kind?: string }).kind, "policy-proposal-rejected");
+      assert.match(String((result.proposal as { reason?: string }).reason), reason);
+      assert.equal(requestedOutputBytes, options.maxOutputBytes);
+      assert.ok(Buffer.byteLength(result.stdout, "utf8") <= (options.maxOutputBytes ?? 0));
+      assert.ok(Buffer.byteLength(result.stderr, "utf8") <= (options.maxOutputBytes ?? 0));
+    }
+  }
+});
+
+test("production policy-review guard returns bounded structured audit rejections", async () => {
+  type RegisteredTool = {
+    name: string;
+    execute: (id: string, params: unknown) => Promise<{ details: Record<string, unknown> }>;
+  };
+  const submissions: ReadonlyArray<[string, unknown, RegExp]> = [
+    ["malformed", null, /must be an object/i],
+    ["forbidden", { rationale: "no", changes: { noveltyWeight: 0.5 }, evaluator: "secret-command" }, /unknown/i],
+    ["unknown", { rationale: "no", changes: { secretWeight: 1 } }, /unknown/i],
+    ["out-of-range", { rationale: "no", changes: { noveltyWeight: 3 } }, /within/i],
+    ["invariant", { rationale: "no", changes: { crossoverCadence: 1.5 } }, /integer/i],
+  ];
+  for (const [name, submission, reason] of submissions) {
+    // Each policy-review worker is fresh, as it is in production.
+    const freshTools = new Map<string, RegisteredTool>();
+    policyReviewGuard({
+      registerTool(tool: RegisteredTool) { freshTools.set(tool.name, tool); },
+      on() {},
+      setActiveTools() {},
+    } as never);
+    const result = await freshTools.get("policy_review_submit")!.execute(name, submission);
+    assert.equal(result.details.accepted, false, name);
+    assert.match(String(result.details.reason), reason, name);
+    assert.equal((result.details.proposal as { kind?: string }).kind, "policy-proposal-rejected", name);
+    const persisted = JSON.stringify(result.details);
+    assert.ok(Buffer.byteLength(persisted) < 2_048, name);
+    assert.equal(persisted.includes("secret-command"), false, name);
+  }
 });

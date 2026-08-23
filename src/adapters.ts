@@ -3,6 +3,8 @@ import type {
   CandidateSubmission,
   Evaluation,
   NodeRecord,
+  PolicyReviewAssignment,
+  PolicyReviewTrigger,
   PromotionGate,
   RunEvent,
   RunSpec,
@@ -27,6 +29,8 @@ export interface ProcessRequest {
   cwd: string;
   env?: Readonly<Record<string, string>>;
   timeoutMs?: number;
+  /** Keep at most this many bytes from each captured stream. */
+  maxOutputBytes?: number;
   input?: string;
   /** Called with the durable POSIX group identity immediately after spawn. */
   onProcessGroup?: (identity: ProcessGroupIdentity) => void | Promise<void>;
@@ -39,6 +43,8 @@ export interface ProcessResult {
   durationMs: number;
   timedOut: boolean;
   cancelled: boolean;
+  /** One or both captured process streams exceeded ProcessRequest.maxOutputBytes. */
+  outputTruncated?: boolean;
   reportedCostUsd?: number;
 }
 
@@ -68,6 +74,9 @@ export interface ProcessExecutor {
 
 export interface WorkerMarker {
   experimentId: string;
+  /** Candidate remains the backward-compatible default; policy reviews have no worktree. */
+  kind?: "candidate" | "policy-review";
+  reviewId?: string;
   process?: ProcessGroupIdentity;
   /** A prior controller durably observed this group gone, so recovery need not signal it. */
   processExited?: true;
@@ -150,6 +159,32 @@ export interface WorkerAdapter {
     signal?: AbortSignal,
     onProcessGroup?: (identity: ProcessGroupIdentity) => void | Promise<void>,
   ): Promise<WorkerOutcome>;
+}
+
+/** Read-only, fresh-process context supplied to the constrained policy reviewer. */
+export interface PolicyReviewContext {
+  spec: RunSpec;
+  review: PolicyReviewAssignment;
+  trigger: PolicyReviewTrigger;
+  activePolicy: import("./contracts.ts").FrontierPolicyVersion;
+  recentOutcomes: readonly import("./contracts.ts").NodeOutcome[];
+}
+
+export interface PolicyReviewOutcome {
+  status: "proposed" | "failed" | "timed-out" | "cancelled";
+  proposal?: unknown;
+  stdout: string;
+  stderr: string;
+  process?: ProcessGroupIdentity;
+  reason?: string;
+}
+
+export interface PolicyReviewerAdapter {
+  review(
+    context: PolicyReviewContext,
+    signal?: AbortSignal,
+    onProcessGroup?: (identity: ProcessGroupIdentity) => void | Promise<void>,
+  ): Promise<PolicyReviewOutcome>;
 }
 
 export interface EvaluatorAdapter {
