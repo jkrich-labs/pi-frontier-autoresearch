@@ -1,0 +1,2 @@
+PUBLIC_MARKER
+This compact artifact is safe to edit while the evaluator and guard stay protected.

@@ -2,6 +2,7 @@
   "name": "pi-frontier-autoresearch",
   "version": "0.1.0",
   "description": "Bounded population-based codebase optimisation for Pi",
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22.19.0"
@@ -15,9 +16,11 @@
     "extensions/",
     "skills/",
     "src/",
+    "examples/generic-fixture/",
     "README.md",
     "LICENSE",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "ATTRIBUTIONS.md"
   ],
   "exports": {
     ".": "./src/index.ts"
@@ -34,6 +37,7 @@
   "scripts": {
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "typecheck": "tsc --noEmit",
+    "pack:check": "npm pack --dry-run",
     "verify": "npm run typecheck && npm test && npm pack --dry-run"
   },
   "peerDependencies": {
