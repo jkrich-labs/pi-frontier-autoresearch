@@ -39,6 +39,7 @@ export interface ProcessExecutor {
 
 export interface StoreAdapter {
   initialise(spec: RunSpec, state: RunState): Promise<void>;
+  writeGeneratedSpec(content: string): Promise<void>;
   append(event: RunEvent): Promise<void>;
   snapshot(state: RunState): Promise<void>;
   load(): Promise<{ events: readonly RunEvent[]; snapshot?: RunState }>;
