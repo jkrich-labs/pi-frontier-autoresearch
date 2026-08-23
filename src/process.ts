@@ -24,6 +24,7 @@ export class NodeProcessExecutor implements ProcessExecutor {
       let timedOut = false;
       let cancelled = false;
       let settled = false;
+      let forceKill: NodeJS.Timeout | undefined;
 
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
@@ -37,6 +38,17 @@ export class NodeProcessExecutor implements ProcessExecutor {
           else process.kill(-child.pid, "SIGTERM");
         } catch {
           child.kill("SIGTERM");
+        }
+        if (!forceKill) {
+          forceKill = setTimeout(() => {
+            if (child.pid === undefined || settled) return;
+            try {
+              if (process.platform === "win32") child.kill("SIGKILL");
+              else process.kill(-child.pid, "SIGKILL");
+            } catch {
+              child.kill("SIGKILL");
+            }
+          }, 1_000);
         }
       };
 
@@ -56,6 +68,7 @@ export class NodeProcessExecutor implements ProcessExecutor {
         if (settled) return;
         settled = true;
         if (timeout) clearTimeout(timeout);
+        if (forceKill) clearTimeout(forceKill);
         signal?.removeEventListener("abort", abort);
         reject(error);
       });
@@ -63,6 +76,7 @@ export class NodeProcessExecutor implements ProcessExecutor {
         if (settled) return;
         settled = true;
         if (timeout) clearTimeout(timeout);
+        if (forceKill) clearTimeout(forceKill);
         signal?.removeEventListener("abort", abort);
         resolve({
           exitCode,

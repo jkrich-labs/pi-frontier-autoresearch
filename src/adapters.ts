@@ -50,6 +50,17 @@ export interface WorktreeHandle {
   path: string;
   parentCommit: string;
   experimentId: string;
+  donorCommit?: string;
+  gitMetadata?: string;
+  gitDirectory?: string;
+  gitCommonDirectory?: string;
+  gitCommonDirectoryRealPath?: string;
+  gitMetadataDigest?: string;
+}
+
+export interface GitMetadataIntegrity {
+  intact: boolean;
+  detail?: string;
 }
 
 export interface CandidateDiff {
@@ -58,11 +69,21 @@ export interface CandidateDiff {
   empty: boolean;
 }
 
-export interface GitWorkspaceAdapter {
+export interface GitWorkspacePort {
   inspectRepository(path: string): Promise<{ root: string; head: string; clean: boolean }>;
-  materialise(assignment: Assignment, parent: NodeRecord): Promise<WorktreeHandle>;
+  materialise(assignment: Assignment, parent: NodeRecord, donor?: NodeRecord): Promise<WorktreeHandle>;
+  verifyGitMetadata(worktree: WorktreeHandle): Promise<GitMetadataIntegrity>;
+  rematerialiseAfterMetadataFailure(
+    worktree: WorktreeHandle,
+    assignment: Assignment,
+    parent: NodeRecord,
+    donor?: NodeRecord,
+  ): Promise<WorktreeHandle>;
   inspectDiff(worktree: WorktreeHandle): Promise<CandidateDiff>;
+  discardChanges(worktree: WorktreeHandle): Promise<void>;
   commitCandidate(worktree: WorktreeHandle, message: string): Promise<{ commit: string; ref: string }>;
+  persistNode(node: NodeRecord): Promise<string>;
+  readNodeRecord(nodeId: string): Promise<NodeRecord>;
   remove(worktree: WorktreeHandle): Promise<void>;
   recover(): Promise<void>;
 }
