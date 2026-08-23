@@ -1,0 +1,53 @@
+{
+  "name": "pi-frontier-autoresearch",
+  "version": "0.1.0",
+  "description": "Bounded population-based codebase optimisation for Pi",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package",
+    "autoresearch",
+    "optimisation"
+  ],
+  "files": [
+    "extensions/",
+    "skills/",
+    "src/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/pi-frontier-autoresearch/index.ts"
+    ],
+    "skills": [
+      "./skills/autoresearch-setup",
+      "./skills/autoresearch-worker"
+    ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run typecheck && npm test && npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.2",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@earendil-works/pi-tui": "^0.84.2",
+    "@types/node": "^24.12.0",
+    "typebox": "^1.3.7",
+    "typescript": "^5.9.3"
+  }
+}
