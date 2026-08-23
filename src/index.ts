@@ -3,6 +3,7 @@ export * from "./candidate.ts";
 export * from "./clock.ts";
 export * from "./configurator.ts";
 export * from "./contracts.ts";
+export * from "./frontier.ts";
 export * from "./git-workspace.ts";
 export * from "./metrics.ts";
 export * from "./paths.ts";
