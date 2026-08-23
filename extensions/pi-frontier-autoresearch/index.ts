@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import {
@@ -12,11 +12,14 @@ import {
   RunConfigurator,
   RunCoordinator,
   SystemClock,
+  FrontierStatusPresenter,
   type RunSpec,
 } from "../../src/index.ts";
+import { detectAutoresearchCommandConflict } from "../../src/command-conflict.ts";
 
 const CONFIGURE_TOOL = "autoresearch_configure";
 const LIFECYCLE_ACTIONS = new Set(["start", "pause", "resume", "status", "stop", "clear"]);
+const CONFLICT_WARNING_HOSTS = Symbol.for("pi-frontier-autoresearch.conflict-warning-hosts");
 
 async function coordinatorFor(cwd: string): Promise<RunCoordinator> {
   const store = new LocalRunStore(cwd);
@@ -52,9 +55,41 @@ function sendSetupPrompt(pi: ExtensionAPI, roughGoal: string, notify: (message: 
   pi.sendUserMessage(`/skill:autoresearch-setup ${goal}`, { expandPromptTemplates: true });
 }
 
-export default function frontierAutoresearch(pi: ExtensionAPI): void {
+function reportCommand(pi: ExtensionAPI, ctx: ExtensionContext, message: string, level: "info" | "warning" | "error"): void {
+  if (ctx.mode === "print") {
+    // Print mode emits only a final assistant response, so command results must
+    // be written explicitly rather than relying on a custom-message event.
+    process.stdout.write(`${message}\n`);
+    return;
+  }
+  // The undefined branch preserves compatibility with minimal embedding test
+  // contexts from before Pi exposed ctx.mode; real Pi contexts always set it.
+  if (ctx.mode === "tui" || ctx.mode === undefined) {
+    ctx.ui.notify(message, level);
+    return;
+  }
+  // JSON/RPC custom messages become structured message events without using
+  // terminal-only notification or widget APIs.
+  pi.sendMessage({ customType: "frontier-autoresearch-command", content: message, display: true }, { triggerTurn: false });
+}
+
+function conflictWarningHosts(): WeakSet<object> {
+  const globalState = globalThis as typeof globalThis & Record<symbol, WeakSet<object> | undefined>;
+  return globalState[CONFLICT_WARNING_HOSTS] ??= new WeakSet<object>();
+}
+
+interface ExtensionRuntime {
+  readonly coordinators: Map<string, Promise<RunCoordinator>>;
+  readonly recoveredCoordinators: Set<string>;
+  readonly router: RunCommandRouter;
+  readonly presenter: FrontierStatusPresenter;
+}
+
+function createExtensionRuntime(): ExtensionRuntime {
   const coordinators = new Map<string, Promise<RunCoordinator>>();
-  const router = new RunCommandRouter((cwd) => {
+  const recoveredCoordinators = new Set<string>();
+
+  function routerCoordinator(cwd: string): Promise<RunCoordinator> {
     const existing = coordinators.get(cwd);
     if (existing) return existing;
     const created = coordinatorFor(cwd);
@@ -63,7 +98,35 @@ export default function frontierAutoresearch(pi: ExtensionAPI): void {
       if (coordinators.get(cwd) === created) coordinators.delete(cwd);
     });
     return created;
+  }
+
+  const router = new RunCommandRouter(routerCoordinator);
+  const presenter = new FrontierStatusPresenter(async (cwd) => {
+    try {
+      const coordinator = await routerCoordinator(cwd);
+      if (recoveredCoordinators.has(cwd)) return coordinator.status();
+      const state = await coordinator.recover();
+      recoveredCoordinators.add(cwd);
+      return state;
+    } catch (error) {
+      if (error instanceof Error && error.message === "No configured frontier autoresearch run was found.") return undefined;
+      throw error;
+    }
   });
+  return { coordinators, recoveredCoordinators, router, presenter };
+}
+
+export default function frontierAutoresearch(pi: ExtensionAPI): void {
+  registerFrontierAutoresearch(pi);
+}
+
+/** Injecting the runtime boundary keeps conflict handling free of run state. */
+export function registerFrontierAutoresearch(
+  pi: ExtensionAPI,
+  createRuntime: () => ExtensionRuntime = createExtensionRuntime,
+): void {
+  let runtime: ExtensionRuntime | undefined;
+  const runtimeFor = (): ExtensionRuntime => runtime ??= createRuntime();
 
   pi.registerTool({
     name: CONFIGURE_TOOL,
@@ -73,7 +136,7 @@ export default function frontierAutoresearch(pi: ExtensionAPI): void {
     parameters: Type.Object({
       config: Type.String({ description: "Complete RunSpec as JSON" }),
     }),
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       let spec: RunSpec;
       try {
         spec = JSON.parse(params.config) as RunSpec;
@@ -87,6 +150,7 @@ export default function frontierAutoresearch(pi: ExtensionAPI): void {
         clock: new SystemClock(),
       });
       const configured = await configurator.configure(spec, signal);
+      await runtimeFor().presenter.refresh(ctx);
       return {
         content: [
           {
@@ -102,7 +166,7 @@ export default function frontierAutoresearch(pi: ExtensionAPI): void {
   pi.registerCommand("autoresearch-prompt", {
     description: "Turn a rough optimisation goal into a validated run",
     handler: async (args, ctx) => {
-      sendSetupPrompt(pi, args, (message) => ctx.ui.notify(message, "warning"));
+      sendSetupPrompt(pi, args, (message) => reportCommand(pi, ctx, message, "warning"));
     },
   });
 
@@ -113,28 +177,51 @@ export default function frontierAutoresearch(pi: ExtensionAPI): void {
       const [action] = trimmed.split(/\s+/, 1);
       if (LIFECYCLE_ACTIONS.has(action ?? "")) {
         try {
-          const result = await router.route(trimmed, {
+          const activeRuntime = runtimeFor();
+          const result = await activeRuntime.router.route(trimmed, {
             cwd: ctx.cwd,
             hasUI: ctx.hasUI,
             ui: ctx.ui,
           });
-          ctx.ui.notify(result, "info");
+          await activeRuntime.presenter.refresh(ctx);
+          reportCommand(pi, ctx, result, "info");
         } catch (error) {
-          ctx.ui.notify(`Autoresearch command failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+          reportCommand(pi, ctx, `Autoresearch command failed: ${error instanceof Error ? error.message : String(error)}`, "error");
         }
         return;
       }
-      sendSetupPrompt(pi, trimmed, (message) => ctx.ui.notify(message, "warning"));
+      sendSetupPrompt(pi, trimmed, (message) => reportCommand(pi, ctx, message, "warning"));
     },
   });
 
-  pi.on("session_start", () => {
+  pi.on("session_start", async (_event, ctx) => {
+    const conflict = detectAutoresearchCommandConflict(pi.getCommands());
+    if (conflict) {
+      const warnedHosts = conflictWarningHosts();
+      if (!warnedHosts.has(pi)) {
+        warnedHosts.add(pi);
+        reportCommand(
+          pi,
+          ctx,
+          `/autoresearch conflict: ${conflict.ours} and ${conflict.other} both register this command; this package will not inspect or migrate legacy run state.`,
+          "warning",
+        );
+      }
+      return;
+    }
+
     const active = pi.getActiveTools().filter((name) => name !== CONFIGURE_TOOL);
     pi.setActiveTools(active);
+    await runtimeFor().presenter.start(ctx);
   });
 
-  pi.on("session_shutdown", async () => {
-    await Promise.all([...coordinators.values()].map(async (coordinator) => {
+  pi.on("session_shutdown", async (_event, ctx) => {
+    if (!runtime) return;
+    await runtime.presenter.shutdown(ctx);
+    const owned = [...runtime.coordinators.values()];
+    runtime.coordinators.clear();
+    runtime.recoveredCoordinators.clear();
+    await Promise.all(owned.map(async (coordinator) => {
       try {
         await (await coordinator).stop("Pi session ended.");
       } catch {

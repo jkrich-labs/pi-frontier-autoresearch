@@ -1,6 +1,7 @@
 export * from "./adapters.ts";
 export * from "./candidate.ts";
 export * from "./clock.ts";
+export * from "./command-conflict.ts";
 export * from "./command-router.ts";
 export * from "./configurator.ts";
 export * from "./coordinator.ts";
@@ -16,5 +17,7 @@ export * from "./policy-tuning.ts";
 export * from "./process.ts";
 export * from "./run-spec.ts";
 export * from "./store.ts";
+export * from "./status-presentation.ts";
+export * from "./status-renderer.ts";
 export * from "./worker-confinement.ts";
 export * from "./worker-contract.ts";
