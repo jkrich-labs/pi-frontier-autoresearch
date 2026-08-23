@@ -3,15 +3,39 @@ import { Type } from "typebox";
 
 import {
   ConfigurationError,
+  Evaluator,
+  GitWorkspaceAdapter,
   LocalRunStore,
   NodeProcessExecutor,
+  PiWorkerAdapter,
+  RunCommandRouter,
   RunConfigurator,
+  RunCoordinator,
   SystemClock,
   type RunSpec,
 } from "../../src/index.ts";
 
 const CONFIGURE_TOOL = "autoresearch_configure";
 const LIFECYCLE_ACTIONS = new Set(["start", "pause", "resume", "status", "stop", "clear"]);
+
+async function coordinatorFor(cwd: string): Promise<RunCoordinator> {
+  const store = new LocalRunStore(cwd);
+  const loaded = await store.load();
+  const configured = loaded.events.find((event) => event.type === "run-configured");
+  const spec = configured?.type === "run-configured" ? configured.data.spec : loaded.snapshot?.spec;
+  if (!spec) throw new Error("No configured frontier autoresearch run was found.");
+  const clock = new SystemClock();
+  const processExecutor = new NodeProcessExecutor(clock);
+  const workspace = new GitWorkspaceAdapter({ repository: spec.targetRepository, runId: spec.runId, processExecutor });
+  return new RunCoordinator({
+    store,
+    workspace,
+    worker: new PiWorkerAdapter({ processExecutor }),
+    evaluator: new Evaluator({ commandExecutor: processExecutor, workspace }),
+    clock,
+    processExecutor,
+  });
+}
 
 function activateConfigureTool(pi: ExtensionAPI): void {
   const active = pi.getActiveTools();
@@ -29,6 +53,18 @@ function sendSetupPrompt(pi: ExtensionAPI, roughGoal: string, notify: (message: 
 }
 
 export default function frontierAutoresearch(pi: ExtensionAPI): void {
+  const coordinators = new Map<string, Promise<RunCoordinator>>();
+  const router = new RunCommandRouter((cwd) => {
+    const existing = coordinators.get(cwd);
+    if (existing) return existing;
+    const created = coordinatorFor(cwd);
+    coordinators.set(cwd, created);
+    void created.catch(() => {
+      if (coordinators.get(cwd) === created) coordinators.delete(cwd);
+    });
+    return created;
+  });
+
   pi.registerTool({
     name: CONFIGURE_TOOL,
     label: "Configure autoresearch",
@@ -76,7 +112,16 @@ export default function frontierAutoresearch(pi: ExtensionAPI): void {
       const trimmed = args.trim();
       const [action] = trimmed.split(/\s+/, 1);
       if (LIFECYCLE_ACTIONS.has(action ?? "")) {
-        ctx.ui.notify(`/${`autoresearch ${action}`} is available after the run coordinator is loaded.`, "info");
+        try {
+          const result = await router.route(trimmed, {
+            cwd: ctx.cwd,
+            hasUI: ctx.hasUI,
+            ui: ctx.ui,
+          });
+          ctx.ui.notify(result, "info");
+        } catch (error) {
+          ctx.ui.notify(`Autoresearch command failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+        }
         return;
       }
       sendSetupPrompt(pi, trimmed, (message) => ctx.ui.notify(message, "warning"));
@@ -86,5 +131,15 @@ export default function frontierAutoresearch(pi: ExtensionAPI): void {
   pi.on("session_start", () => {
     const active = pi.getActiveTools().filter((name) => name !== CONFIGURE_TOOL);
     pi.setActiveTools(active);
+  });
+
+  pi.on("session_shutdown", async () => {
+    await Promise.all([...coordinators.values()].map(async (coordinator) => {
+      try {
+        await (await coordinator).stop("Pi session ended.");
+      } catch {
+        // A configured, completed, or absent run needs no shutdown action.
+      }
+    }));
   });
 }

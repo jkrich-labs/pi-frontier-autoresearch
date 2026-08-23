@@ -10,7 +10,7 @@ import {
 import { Evaluator } from "./evaluator.ts";
 import { MetricParseError, parseMetricOutput } from "./metrics.ts";
 import { LOCAL_RUN_GLOB } from "./paths.ts";
-import { renderRunSpec } from "./run-spec.ts";
+import { digestRunSpec, renderRunSpec } from "./run-spec.ts";
 
 export class ConfigurationError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -69,8 +69,18 @@ export class RunConfigurator {
     };
     const generatedSpec = renderRunSpec(spec, baseline);
     await this.#store.initialise(spec, state);
+    const configuredEvent = {
+      index: 1,
+      type: "run-configured" as const,
+      at: new Date(this.#clock.now()).toISOString(),
+      runId: spec.runId,
+      data: { specDigest: digestRunSpec(spec), spec, baseline },
+    };
+    await this.#store.append(configuredEvent);
+    const persistedState = { ...state, lastEventIndex: configuredEvent.index };
+    await this.#store.snapshot(persistedState);
     await this.#store.writeGeneratedSpec(generatedSpec);
-    return { state, generatedSpec };
+    return { state: persistedState, generatedSpec };
   }
 
   async #verifyRepository(spec: RunSpec, signal?: AbortSignal): Promise<void> {

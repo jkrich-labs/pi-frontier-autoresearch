@@ -1,4 +1,4 @@
-import type { CandidateDiff, GitWorkspacePort, WorkerAdapter, WorkerOutcome } from "./adapters.ts";
+import type { CandidateDiff, GitWorkspacePort, ProcessGroupIdentity, WorkerAdapter, WorkerOutcome } from "./adapters.ts";
 import type {
   Assignment,
   CandidateSubmission,
@@ -15,6 +15,11 @@ export interface CreateCandidateRequest {
   parent: NodeRecord;
   donor?: NodeRecord;
   signal?: AbortSignal;
+  onProcessGroup?: (identity: ProcessGroupIdentity) => void | Promise<void>;
+  /** Persists worker-return accounting before metadata verification or node persistence. */
+  onWorkerResult?: (worker: WorkerOutcome) => void | Promise<void>;
+  /** Runs after the worker has returned and before any controller worktree access. */
+  onProcessGroupExit?: (identity: ProcessGroupIdentity) => void | Promise<void>;
 }
 
 export interface CandidateResult {
@@ -22,6 +27,14 @@ export interface CandidateResult {
   submission?: CandidateSubmission;
   worker: WorkerOutcome;
   reason?: string;
+}
+
+/** The coordinator stopped after assignment persistence but before a worker was spawned. */
+export class WorkerLaunchPreventedError extends Error {
+  constructor() {
+    super("Worker launch was prevented before spawn");
+    this.name = "WorkerLaunchPreventedError";
+  }
 }
 
 export class CandidateCreator {
@@ -34,15 +47,21 @@ export class CandidateCreator {
   }
 
   async create(request: CreateCandidateRequest): Promise<CandidateResult> {
-    const { spec, assignment, parent, donor, signal } = request;
+    const { spec, assignment, parent, donor, signal, onProcessGroup, onWorkerResult, onProcessGroupExit } = request;
     if (assignment.operator === "crossover" && (!donor || donor.id !== assignment.donorParentId)) {
       throw new Error("A crossover assignment requires its assigned donor node");
     }
+    if (signal?.aborted) throw new WorkerLaunchPreventedError();
     let worktree = await this.#workspace.materialise(assignment, parent, donor);
     try {
+      if (signal?.aborted) throw new WorkerLaunchPreventedError();
       let worker: WorkerOutcome;
+      let process: ProcessGroupIdentity | undefined;
       try {
-        worker = await this.#worker.run(spec, assignment, worktree, signal);
+        worker = await this.#worker.run(spec, assignment, worktree, signal, async (identity) => {
+          process = identity;
+          await onProcessGroup?.(identity);
+        });
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         worker = {
@@ -52,6 +71,16 @@ export class CandidateCreator {
           reason,
         };
       }
+      // The group must be confirmed gone before this controller touches the worktree
+      // again. This creates a durable-safe gap between worker exit and node persistence.
+      if (worker.process && (!process || worker.process.processGroupId !== process.processGroupId ||
+        worker.process.leaderPid !== process.leaderPid || worker.process.leaderStartIdentity !== process.leaderStartIdentity)) {
+        throw new Error("Worker returned a process identity that was not durably reported at spawn");
+      }
+      // The result includes billed cost and the worker's own terminal reason. Keep it
+      // durable before waiting for descendants, checking metadata, or persisting Git.
+      await onWorkerResult?.(worker);
+      if (process) await onProcessGroupExit?.(process);
       // This must be the first controller interaction with the worktree after the
       // worker. In particular, do not let Git status/diff refresh a corrupted index.
       const metadataIntegrity = await this.#workspace.verifyGitMetadata(worktree);
@@ -108,12 +137,49 @@ export class CandidateCreator {
         metricSamples: {},
         guardResults: [],
         outcome,
+        ...(worker.reportedCostUsd === undefined ? {} : { reportedCostUsd: worker.reportedCostUsd }),
         policyVersion: assignment.policyVersion,
         createdEventIndex: 0,
         selection: { attempts: 0, promotions: 0 },
       };
       await this.#workspace.persistNode(node);
       return { node, submission, worker, reason };
+    } finally {
+      await this.#workspace.remove(worktree);
+    }
+  }
+
+  /**
+   * Close a persisted assignment that lost its worker before a candidate node was saved.
+   * The empty commit is Git-backed evidence of the interruption, not a retry.
+   */
+  async interrupt(request: Omit<CreateCandidateRequest, "signal" | "onProcessGroup" | "onWorkerResult" | "onProcessGroupExit">, reason: string): Promise<NodeRecord> {
+    const { assignment, parent, donor } = request;
+    let worktree = await this.#workspace.materialise(assignment, parent, donor);
+    try {
+      await this.#workspace.discardChanges(worktree);
+      const committed = await this.#workspace.commitCandidate(
+        worktree,
+        `frontier candidate ${assignment.experimentId}\n\nOutcome: interrupted\nReason: ${reason}`,
+      );
+      const node: NodeRecord = {
+        id: assignment.experimentId,
+        commit: committed.commit,
+        ref: committed.ref,
+        parentIds: [parent.id, ...(donor ? [donor.id] : [])],
+        operator: assignment.operator,
+        hypothesis: assignment.hypothesis,
+        reflection: reason,
+        diffSummary: { changedFiles: [], changedLines: 0 },
+        metricSamples: {},
+        guardResults: [],
+        outcome: "interrupted",
+        policyVersion: assignment.policyVersion,
+        createdEventIndex: 0,
+        selection: { attempts: 0, promotions: 0 },
+      };
+      await this.#workspace.persistNode(node);
+      return node;
     } finally {
       await this.#workspace.remove(worktree);
     }

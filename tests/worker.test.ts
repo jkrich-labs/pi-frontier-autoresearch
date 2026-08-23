@@ -15,6 +15,7 @@ import {
   parseCandidateSubmission,
   type Assignment,
   type NodeRecord,
+  type ProcessGroupIdentity,
   type RunSpec,
 } from "../src/index.ts";
 import workerGuard from "../extensions/pi-frontier-autoresearch/worker-guard.ts";
@@ -126,14 +127,19 @@ console.log(JSON.stringify({ type: "tool_result_end", message: { toolName: "cand
   if (previousReasoning === undefined) delete process.env.PI_REASONING_LEVEL;
   else process.env.PI_REASONING_LEVEL = previousReasoning;
   const creator = new CandidateCreator(workspace, worker);
+  let reportedProcess: ProcessGroupIdentity | undefined;
   const result = await creator.create({
     spec: runSpec(repository.root),
     assignment,
     parent: parentNode(repository.head),
+    onProcessGroup: (identity) => { reportedProcess = identity; },
   });
 
   assert.equal(result.node.outcome, "pending");
   assert.match(result.worker.stdout, /Output truncated:.*Full output:/);
+  assert.deepEqual(result.worker.process, reportedProcess);
+  assert.ok(reportedProcess && reportedProcess.processGroupId > 0 && reportedProcess.leaderPid > 0);
+  assert.match(reportedProcess?.leaderStartIdentity ?? "", /^(linux:|darwin-token:)/);
   assert.equal(result.node.ref, "refs/pi-frontier-autoresearch/fixture-run/nodes/candidate-1");
   assert.equal(await git(repository.root, "rev-parse", result.node.ref), result.node.commit);
   assert.match(await git(repository.root, "rev-parse", workspace.recordRef(result.node.id)), /^[0-9a-f]{40,64}$/);

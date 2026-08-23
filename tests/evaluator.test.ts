@@ -704,6 +704,46 @@ test("evaluator fails before further confirmation evidence when the parent evalu
   assert.match(result.reason, /tracked or untracked changes/);
 });
 
+test("evaluator rejects Git metadata mutation in both confirmation worktrees", async (t) => {
+  for (const item of [
+    { name: "parent", mutationCall: 1, labels: ["evaluator", "confirmation-parent"] },
+    { name: "candidate", mutationCall: 2, labels: ["evaluator", "confirmation-parent", "confirmation-candidate"] },
+  ] as const) {
+    const counter = join(tmpdir(), `frontier-confirmation-git-metadata-${item.name}-${Date.now()}-${Math.random()}`);
+    const fixture = await repository([
+      "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
+      "const call = existsSync(process.env.COUNTER) ? Number(readFileSync(process.env.COUNTER, 'utf8')) : 0;",
+      "writeFileSync(process.env.COUNTER, String(call + 1));",
+      "if (call === Number(process.env.MUTATION_CALL)) writeFileSync('.git', 'gitdir: /tampered\\n');",
+      "const candidate = readFileSync('source.txt', 'utf8').trim() === 'candidate';",
+      "console.log(`METRIC score=${candidate ? 90 : 100}`);",
+    ].join("\n"));
+    t.after(() => Promise.all([rm(fixture.root, { recursive: true, force: true }), rm(counter, { force: true })]));
+    const configured = spec(fixture.root);
+    configured.evaluator = {
+      ...configured.evaluator,
+      env: { COUNTER: counter, MUTATION_CALL: String(item.mutationCall) },
+    };
+    const input = productionGate(fixture, {
+      parentFiles: ["src/parent.ts"],
+      parentLines: 10,
+      candidateFiles: ["src/candidate.ts"],
+      candidateLines: 1,
+    });
+
+    const result = await new Evaluator({
+      commandExecutor: new NodeProcessExecutor(),
+      workspace: new GitWorkspaceAdapter({ repository: fixture.root, runId: `confirmation-git-metadata-${item.name}` }),
+    }).evaluate(configured, input.candidate, input.parent, input.gate);
+
+    assert.equal(result.confirmationAttempted, true, item.name);
+    assert.equal(result.evidence?.confirmation?.outcome, "failed", item.name);
+    assert.deepEqual(result.evidence?.logs.map((log) => log.label), item.labels, item.name);
+    assert.equal(result.guards.find((guard) => guard.name === "worktree identity")?.status, "failed", item.name);
+    assert.match(result.reason, /Git marker changed/, item.name);
+  }
+});
+
 test("evaluator rejects an evaluator command that mutates its candidate worktree", async (t) => {
   const fixture = await repository([
     "import { readFileSync, writeFileSync } from 'node:fs';",

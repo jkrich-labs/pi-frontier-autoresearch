@@ -189,6 +189,8 @@ export interface NodeRecord {
   metricSamples: Readonly<Record<string, readonly number[]>>;
   guardResults: readonly GuardResult[];
   outcome: NodeOutcome;
+  /** Captured in the Git-backed node before the worker-finished event is appended. */
+  reportedCostUsd?: number;
   policyVersion: number;
   createdEventIndex: number;
   selection: {
@@ -225,6 +227,7 @@ export interface RunState {
 
 export type RunEventType =
   | "run-configured"
+  | "frontier-policy-recorded"
   | "run-started"
   | "pause-requested"
   | "run-paused"
@@ -242,7 +245,8 @@ export type RunEventType =
   | "run-failed";
 
 export interface RunEventDataMap {
-  "run-configured": { specDigest: string };
+  "run-configured": { specDigest: string; spec: RunSpec; baseline: BaselineRecord };
+  "frontier-policy-recorded": Record<string, never>;
   "run-started": Record<string, never>;
   "pause-requested": Record<string, never>;
   "run-paused": Record<string, never>;

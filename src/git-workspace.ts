@@ -294,13 +294,26 @@ export class GitWorkspaceAdapter implements GitWorkspacePort {
   }
 
   async persistNode(node: NodeRecord): Promise<string> {
+    if (node.ref !== this.nodeRef(node.id)) {
+      throw new Error(`Node ${node.id} has an unexpected Git ref`);
+    }
+    const existing = await this.#process.run({
+      command: "git",
+      args: ["rev-parse", "--verify", node.ref],
+      cwd: this.repository,
+    });
+    if (existing.exitCode === 0 && existing.stdout.trim() !== node.commit) {
+      throw new Error(`Node ref already points to a different commit: ${node.ref}`);
+    }
+    if (existing.exitCode !== 0) await this.#git(["update-ref", node.ref, node.commit]);
+
     const ref = this.recordRef(node.id);
     const object = await this.#git(
       ["hash-object", "-w", "--stdin"],
       this.repository,
       { input: `${JSON.stringify(node)}\n` },
     );
-    await this.#git(["update-ref", ref, object, "0000000000000000000000000000000000000000"]);
+    await this.#git(["update-ref", ref, object]);
     return ref;
   }
 

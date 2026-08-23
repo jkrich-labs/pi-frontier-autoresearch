@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { ProcessExecutor, WorkerAdapter, WorkerOutcome, WorktreeHandle } from "./adapters.ts";
+import type { ProcessExecutor, ProcessGroupIdentity, WorkerAdapter, WorkerOutcome, WorktreeHandle } from "./adapters.ts";
 import type { Assignment, CandidateSubmission, RunSpec } from "./contracts.ts";
 import { NodeProcessExecutor } from "./process.ts";
 import {
@@ -97,6 +97,7 @@ export class PiWorkerAdapter implements WorkerAdapter {
     assignment: Assignment,
     worktree: WorktreeHandle,
     signal?: AbortSignal,
+    onProcessGroup?: (identity: ProcessGroupIdentity) => void | Promise<void>,
   ): Promise<WorkerOutcome> {
     const config = createWorkerGuardConfig(spec, assignment, worktree);
     const configDirectory = await mkdtemp(resolve(tmpdir(), "pi-frontier-worker-"));
@@ -126,6 +127,7 @@ export class PiWorkerAdapter implements WorkerAdapter {
     args.push(this.#prompt(spec, assignment));
 
     try {
+      let process: ProcessGroupIdentity | undefined;
       const result = await this.#process.run(
         {
           command: this.#options.executable,
@@ -133,6 +135,10 @@ export class PiWorkerAdapter implements WorkerAdapter {
           cwd: worktree.path,
           env: { PI_FRONTIER_WORKER_CONFIG: configPath },
           timeoutMs: this.#options.timeoutMs,
+          onProcessGroup: async (identity) => {
+            process = identity;
+            await onProcessGroup?.(identity);
+          },
         },
         signal,
       );
@@ -141,10 +147,10 @@ export class PiWorkerAdapter implements WorkerAdapter {
       const stderr = this.#truncateOutput(result.stderr, logPaths.stderr);
       const reportedCostUsd = reportedCostFromOutput(result.stdout);
       if (result.cancelled) {
-        return { status: "cancelled", stdout, stderr, reportedCostUsd, reason: "Worker cancelled" };
+        return { status: "cancelled", stdout, stderr, reportedCostUsd, process, reason: "Worker cancelled" };
       }
       if (result.timedOut) {
-        return { status: "timed-out", stdout, stderr, reportedCostUsd, reason: "Worker timed out" };
+        return { status: "timed-out", stdout, stderr, reportedCostUsd, process, reason: "Worker timed out" };
       }
       if (result.exitCode !== 0) {
         return {
@@ -152,6 +158,7 @@ export class PiWorkerAdapter implements WorkerAdapter {
           stdout,
           stderr,
           reportedCostUsd,
+          process,
           reason: `Worker exited with status ${String(result.exitCode)}`,
         };
       }
@@ -162,6 +169,7 @@ export class PiWorkerAdapter implements WorkerAdapter {
         stdout,
         stderr,
         reportedCostUsd,
+        process,
         reason: submission ? undefined : "Worker exited without a structured candidate submission",
       };
     } catch (error) {
