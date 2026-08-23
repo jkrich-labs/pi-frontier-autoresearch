@@ -755,3 +755,40 @@ test("non-TUI prompt, configure, lifecycle, status, and error paths use text or 
     await harness.handlers.get("session_shutdown")?.({}, context);
   }
 });
+
+test("configure tool streams live progress through onUpdate", async (t) => {
+  const harness = extensionHarness();
+  frontierAutoresearch(harness.pi);
+  const root = await repository(t, "frontier-progress-");
+  // A slow evaluator keeps stages separated across the 250ms throttle window,
+  // so the test observes real multi-stage streaming rather than coalescing.
+  const bench = join(root, "slow-bench.mjs");
+  await writeFile(bench, [
+    "import { setTimeout as sleep } from 'node:timers/promises';",
+    "await sleep(400);",
+    "console.log('METRIC build_ms=100');",
+  ].join("\n"));
+  const spec = {
+    ...configSpec(root),
+    evaluator: { command: `${JSON.stringify(process.execPath)} slow-bench.mjs`, timeoutMs: 5_000 },
+  };
+
+  const updates: string[] = [];
+  const configure = harness.tools.get("autoresearch_configure");
+  assert.ok(configure, "configure tool must be registered");
+  await configure.execute(
+    "progress-config",
+    { config: JSON.stringify(spec) },
+    undefined,
+    (partial: { content: { type: string; text: string }[]; details?: { progress?: string } }) => {
+      const text = partial.content?.[0]?.type === "text" ? partial.content[0].text : "";
+      updates.push(text);
+    },
+    { cwd: root, hasUI: false, ui: { notify() {} } },
+  );
+
+  assert.ok(updates.length >= 4, `progress updates streamed (got ${updates.length})`);
+  assert.match(updates[0] ?? "", /Verifying/);
+  assert.ok(updates.some((text) => /Calibrating baseline/.test(text)), "baseline progress must be streamed");
+  assert.ok(updates.some((text) => /Persisting/.test(text)), "persist progress must be streamed");
+});

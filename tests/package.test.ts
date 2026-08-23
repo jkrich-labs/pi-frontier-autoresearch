@@ -53,6 +53,7 @@ const packedManifest = [
   "src/policy-reviewer.ts",
   "src/policy-tuning.ts",
   "src/process.ts",
+  "src/progress.ts",
   "src/run-spec.ts",
   "src/status-presentation.ts",
   "src/status-renderer.ts",
@@ -393,7 +394,7 @@ test("package dry run has the exact sorted release manifest", () => {
   const result = pack(["--dry-run"]);
   const paths = result.files.map((file) => file.path).sort();
   assert.ok(paths.includes(fixtureArtifact), `missing packed fixture artifact: ${fixtureArtifact}`);
-  assert.equal(paths.length, 38, "the release artifact file count is an explicit criterion");
+  assert.equal(paths.length, 39, "the release artifact file count is an explicit criterion");
   assert.ok(paths.every((path) => !path.startsWith("tests/") && path !== "tsconfig.json"));
   assert.deepEqual(paths, packedManifest, "packed files must exactly match the release manifest");
 });

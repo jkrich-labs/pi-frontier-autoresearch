@@ -17,6 +17,7 @@ import type {
 } from "./contracts.ts";
 import { MetricParseError, parseMetricOutput, summariseSamples } from "./metrics.ts";
 import { LOCAL_RUN_DIRECTORY } from "./paths.ts";
+import type { ProgressReporter } from "./progress.ts";
 import { WorkerConfinement } from "./worker-confinement.ts";
 
 const MAD_SCALE = 1.4826;
@@ -249,11 +250,12 @@ export class Evaluator implements EvaluatorAdapter {
     this.#maxOutputBytes = dependencies.maxOutputBytes ?? 16_384;
   }
 
-  async calibrate(spec: RunSpec, signal?: AbortSignal): Promise<Evaluation> {
+  async calibrate(spec: RunSpec, signal?: AbortSignal, onProgress?: ProgressReporter): Promise<Evaluation> {
     const samples: Record<string, number[]> = Object.fromEntries(spec.metrics.map((metric) => [metric.name, []]));
     const logs: EvaluationLog[] = [];
     const required = requiredMetricNames(spec, true);
     for (let index = 0; index < spec.baseline.samples; index += 1) {
+      onProgress?.({ stage: "baseline", sample: index + 1, total: spec.baseline.samples, message: `Running baseline sample ${index + 1} of ${spec.baseline.samples}` });
       const attempt = await this.#sample(spec, spec.targetRepository, `baseline-${index + 1}`, logs, required, signal);
       if (!attempt.metrics) {
         const successful = samples[spec.primaryMetric]!.length;

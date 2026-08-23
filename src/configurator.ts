@@ -11,6 +11,7 @@ import { Evaluator } from "./evaluator.ts";
 import { MetricParseError, parseMetricOutput } from "./metrics.ts";
 import { LOCAL_RUN_GLOB } from "./paths.ts";
 import { initialPolicyVersion } from "./policy-tuning.ts";
+import { noopProgress, type ProgressReporter } from "./progress.ts";
 import { digestRunSpec, renderRunSpec } from "./run-spec.ts";
 
 export class ConfigurationError extends Error {
@@ -24,6 +25,8 @@ export interface ConfiguratorDependencies {
   commandExecutor: ProcessExecutor;
   store: StoreAdapter;
   clock: Clock;
+  /** Optional structured progress reporter for long-running configuration work. */
+  onProgress?: ProgressReporter;
 }
 
 export interface ConfiguredRun {
@@ -36,13 +39,17 @@ export class RunConfigurator {
   readonly #store: StoreAdapter;
   readonly #clock: Clock;
 
+  readonly #onProgress: ProgressReporter | undefined;
+
   constructor(dependencies: ConfiguratorDependencies) {
     this.#commandExecutor = dependencies.commandExecutor;
     this.#store = dependencies.store;
     this.#clock = dependencies.clock;
+    this.#onProgress = dependencies.onProgress;
   }
 
-  async configure(input: unknown, signal?: AbortSignal): Promise<ConfiguredRun> {
+  async configure(input: unknown, signal?: AbortSignal, onProgress?: ProgressReporter): Promise<ConfiguredRun> {
+    const progress = onProgress ?? this.#onProgress ?? noopProgress();
     try {
       assertRunSpec(input);
     } catch (error) {
@@ -53,14 +60,19 @@ export class RunConfigurator {
       ...input,
       protectedPaths: [...new Set([...input.protectedPaths, LOCAL_RUN_GLOB])],
     };
+    progress({ stage: "verify-repository", message: `Verifying ${spec.targetRepository} is a Git repository root` });
     await this.#verifyRepository(spec, signal);
+    progress({ stage: "verify-scope", message: "Checking editable and protected path overlap" });
     this.#verifyScope(spec);
-    await this.#dryRunCommands(spec, signal);
+    progress({ stage: "dry-run-evaluator", message: "Dry-running the evaluator command" });
+    await this.#dryRunCommands(spec, signal, progress);
     // LocalRunStore claims its empty directory atomically here, before the
     // expensive baseline. Concurrent coordinators therefore cannot both
     // calibrate and later race while overwriting one another's state.
     const initialisationClaim = await this.#store.claimInitialisation(spec);
-    const baseline = await this.#calibrate(spec, signal);
+    progress({ stage: "baseline", sample: 0, total: spec.baseline.samples, message: "Calibrating baseline" });
+    const baseline = await this.#calibrate(spec, signal, progress);
+    progress({ stage: "verify-baseline-guards", message: "Verifying baseline against metric guards" });
     this.#verifyBaselineGuards(spec, baseline);
     const initialPolicy = initialPolicyVersion(spec.frontierPolicy);
     const state: RunState = {
@@ -77,6 +89,7 @@ export class RunConfigurator {
       latestDecision: "Run configured; use /autoresearch start to begin experiments.",
     };
     const generatedSpec = renderRunSpec(spec, baseline);
+    progress({ stage: "persist", message: "Persisting configured run state" });
     await this.#store.initialise(spec, state, initialisationClaim);
     const configuredEvent = {
       index: 1,
@@ -133,7 +146,7 @@ export class RunConfigurator {
     }
   }
 
-  async #dryRunCommands(spec: RunSpec, signal?: AbortSignal): Promise<void> {
+  async #dryRunCommands(spec: RunSpec, signal?: AbortSignal, onProgress?: ProgressReporter): Promise<void> {
     const evaluator = await this.#requireSuccessfulCommand(spec, spec.evaluator, "Evaluator command", signal);
     const metrics = this.#parseMetrics(spec, evaluator.stdout);
     if (metrics[spec.primaryMetric] === undefined) {
@@ -141,17 +154,19 @@ export class RunConfigurator {
     }
 
     for (const probe of spec.probes) {
+      onProgress?.({ stage: "dry-run-probe", name: probe.name, message: `Dry-running probe "${probe.name}"` });
       await this.#requireSuccessfulCommand(spec, probe, `Probe "${probe.name}"`, signal);
     }
     for (const guard of spec.guards) {
       if (guard.type === "command") {
+        onProgress?.({ stage: "dry-run-guard", name: guard.name, message: `Dry-running guard "${guard.name}"` });
         await this.#requireSuccessfulCommand(spec, guard.command, `Guard "${guard.name}"`, signal);
       }
     }
   }
 
-  async #calibrate(spec: RunSpec, signal?: AbortSignal): Promise<BaselineRecord> {
-    const calibration = await new Evaluator({ commandExecutor: this.#commandExecutor }).calibrate(spec, signal);
+  async #calibrate(spec: RunSpec, signal?: AbortSignal, onProgress?: ProgressReporter): Promise<BaselineRecord> {
+    const calibration = await new Evaluator({ commandExecutor: this.#commandExecutor }).calibrate(spec, signal, onProgress);
     if (calibration.guards.some((guard) => guard.name === "evaluator" && guard.status === "failed")) {
       throw new ConfigurationError(calibration.reason);
     }

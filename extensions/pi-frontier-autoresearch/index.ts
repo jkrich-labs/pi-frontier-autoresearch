@@ -1,4 +1,5 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import {
@@ -13,6 +14,8 @@ import {
   RunCoordinator,
   SystemClock,
   FrontierStatusPresenter,
+  type ConfigureProgressEvent,
+  type ProgressReporter,
   type RunSpec,
 } from "../../src/index.ts";
 import { detectAutoresearchCommandConflict } from "../../src/command-conflict.ts";
@@ -20,6 +23,84 @@ import { detectAutoresearchCommandConflict } from "../../src/command-conflict.ts
 const CONFIGURE_TOOL = "autoresearch_configure";
 const LIFECYCLE_ACTIONS = new Set(["start", "pause", "resume", "status", "stop", "clear"]);
 const CONFLICT_WARNING_HOSTS = Symbol.for("pi-frontier-autoresearch.conflict-warning-hosts");
+const PROGRESS_THROTTLE_MS = 250;
+
+/**
+ * Throttled bridge from structured configure progress into the tool's live
+ * partial-result updates. Mirrors the bash tool's streaming pattern so the TUI
+ * tool row renders each stage as it happens instead of staying blank. The
+ * returned flush() emits any trailing pending stage immediately, so the last
+ * visible line always reflects the latest stage even when work completes faster
+ * than the throttle window.
+ */
+function throttledProgress(
+  onUpdate: ((partial: AgentToolResult<unknown>) => void) | undefined,
+): { report: ProgressReporter | undefined; flush: () => void } {
+  if (!onUpdate) return { report: undefined, flush: () => {} };
+  let lastEmit = 0;
+  let pending: ConfigureProgressEvent | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const emit = (event: ConfigureProgressEvent): void => {
+    pending = undefined;
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+    lastEmit = Date.now();
+    const text = progressLine(event);
+    onUpdate({ content: [{ type: "text", text }], details: { progress: text } });
+  };
+  const schedule = (event: ConfigureProgressEvent): void => {
+    pending = event;
+    if (timer) return;
+    const delay = PROGRESS_THROTTLE_MS - (Date.now() - lastEmit);
+    if (delay <= 0) {
+      emit(event);
+      return;
+    }
+    timer = setTimeout(() => {
+      timer = undefined;
+      if (pending) emit(pending);
+    }, delay);
+  };
+  const flush = (): void => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+    if (pending) emit(pending);
+  };
+  return { report: (event) => schedule(event), flush };
+}
+
+function progressLine(event: ConfigureProgressEvent): string {
+  switch (event.stage) {
+    case "verify-repository":
+    case "verify-scope":
+    case "dry-run-evaluator":
+    case "verify-baseline-guards":
+    case "persist":
+      return event.message;
+    case "dry-run-probe":
+      return `Dry-running probe "${event.name}"`;
+    case "dry-run-guard":
+      return `Dry-running guard "${event.name}"`;
+    case "baseline":
+      return event.sample === 0
+        ? `Calibrating baseline (${event.total} samples)`
+        : `Calibrating baseline: sample ${event.sample} of ${event.total}`;
+  }
+}
+
+function parseRunId(config: unknown): string | undefined {
+  if (typeof config !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(config) as { runId?: unknown };
+    return typeof parsed.runId === "string" && parsed.runId ? parsed.runId : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 async function coordinatorFor(cwd: string): Promise<RunCoordinator> {
   const store = new LocalRunStore(cwd);
@@ -142,7 +223,21 @@ export function registerFrontierAutoresearch(
     parameters: Type.Object({
       config: Type.String({ description: "Complete RunSpec as JSON" }),
     }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+    renderCall(args, theme) {
+      const runId = parseRunId(args?.config);
+      let content = theme.fg("toolTitle", theme.bold("Configure autoresearch"));
+      if (runId) content += ` ${theme.fg("muted", runId)}`;
+      return new Text(content, 0, 0);
+    },
+    renderResult(result, { isPartial }, theme) {
+      const details = result.details as { progress?: string } | undefined;
+      const text = details?.progress ?? (result.content?.[0]?.type === "text" ? result.content[0].text : undefined);
+      if (isPartial) {
+        return new Text(theme.fg("warning", text ? `⟳ ${text}` : "Working..."), 0, 0);
+      }
+      return new Text(theme.fg("success", "✓ Run configured"), 0, 0);
+    },
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       let spec: RunSpec;
       try {
         spec = JSON.parse(params.config) as RunSpec;
@@ -155,7 +250,13 @@ export function registerFrontierAutoresearch(
         store,
         clock: new SystemClock(),
       });
-      const configured = await configurator.configure(spec, signal);
+      const progress = throttledProgress(onUpdate);
+      let configured;
+      try {
+        configured = await configurator.configure(spec, signal, progress.report);
+      } finally {
+        progress.flush();
+      }
       await runtimeFor().presenter.refresh(ctx);
       return {
         content: [

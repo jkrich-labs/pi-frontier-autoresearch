@@ -62,6 +62,8 @@ The setup agent inspects the repository and asks only for decisions it cannot in
 
 Setup does not start experiments.
 
+Configuration runs the evaluator command once as a dry check, then again for each baseline sample (three by default). In the terminal UI the `autoresearch_configure` tool row streams the current stage live — repository verification, dry-run of the evaluator, probes and guards, and each baseline sample — so you can see exactly what is happening instead of waiting on a blank spinner. Calibration can take several minutes when the evaluator is an authenticated benchmark; the progress line updates as each stage completes.
+
 ### 3. Review the generated run
 
 Before starting, check that:

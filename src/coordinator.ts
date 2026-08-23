@@ -30,6 +30,7 @@ import { FrontierController, type FrontierEvent } from "./frontier.ts";
 import { NodeProcessExecutor } from "./process.ts";
 import { RunConfigurator, type ConfiguredRun } from "./configurator.ts";
 import { PolicyReviewer } from "./policy-reviewer.ts";
+import type { ProgressReporter } from "./progress.ts";
 import {
   initialPolicyVersion,
   restoredPolicyVersion,
@@ -178,7 +179,7 @@ export class RunCoordinator {
     this.#creator = new CandidateCreator(this.#workspace, this.#worker);
   }
 
-  async configure(input: unknown, signal?: AbortSignal): Promise<ConfiguredRun> {
+  async configure(input: unknown, signal?: AbortSignal, onProgress?: ProgressReporter): Promise<ConfiguredRun> {
     return await this.#exclusive(async () => {
       if (this.#clearing) throw new Error("Cannot configure while the current run is being cleared.");
       if (this.#loop) throw new Error("Stop the active run before configuring another run.");
@@ -187,7 +188,7 @@ export class RunCoordinator {
       if (existing.events.length > 0 || existing.snapshot || hasArtifacts === true) {
         throw new Error("Durable run state already exists; use /autoresearch clear before configuring another run.");
       }
-      const configured = await this.#configurator.configure(input, signal);
+      const configured = await this.#configurator.configure(input, signal, onProgress);
       await this.#loadUnlocked(true);
       return configured;
     });

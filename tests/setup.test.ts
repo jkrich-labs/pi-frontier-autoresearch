@@ -342,6 +342,50 @@ test("input handler activates the configure tool for direct and expanded setup s
   assert.equal(activeTools.length, 2, "non-setup input must not reactivate the tool");
 });
 
+test("configure reports structured progress through every stage", async () => {
+  const root = await fixtureRepository();
+  const store = new MemoryStore();
+  const configurator = new RunConfigurator({
+    commandExecutor: new NodeProcessExecutor(),
+    store,
+    clock: new ManualClock(1_700_000_000_000),
+  });
+  const events: string[] = [];
+  const spec = {
+    ...runSpec(root),
+    probes: [
+      { name: "typecheck", description: "Type check", command: `${JSON.stringify(process.execPath)} -e ""`, timeoutMs: 5_000 },
+    ],
+    guards: [
+      { type: "command", name: "fixed-correctness", command: { command: `${JSON.stringify(process.execPath)} -e ""`, timeoutMs: 5_000 } },
+    ],
+  };
+  const configured = await configurator.configure(spec, undefined, (event) => {
+    events.push(event.stage === "baseline"
+      ? `baseline:${event.sample}/${event.total}`
+      : event.stage === "dry-run-probe"
+        ? `dry-run-probe:${event.name}`
+        : event.stage === "dry-run-guard"
+          ? `dry-run-guard:${event.name}`
+          : event.stage);
+  });
+
+  assert.ok(configured.state.baseline?.samples.build_ms?.length === 3);
+  assert.deepEqual(events, [
+    "verify-repository",
+    "verify-scope",
+    "dry-run-evaluator",
+    "dry-run-probe:typecheck",
+    "dry-run-guard:fixed-correctness",
+    "baseline:0/3",
+    "baseline:1/3",
+    "baseline:2/3",
+    "baseline:3/3",
+    "verify-baseline-guards",
+    "persist",
+  ]);
+});
+
 test("ConfigurationError remains an explicit caller contract", () => {
   assert.equal(new ConfigurationError("bad setup").name, "ConfigurationError");
 });
